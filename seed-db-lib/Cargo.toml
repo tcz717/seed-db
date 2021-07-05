@@ -1,0 +1,15 @@
+[package]
+name = "seed-db-lib"
+version = "0.1.0"
+authors = ["Chengzhi Tan <tcz717@hotmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version="1.*", features=["net"] }
+tokio-util = { version="0.*", features=["net", "codec"] }
+bytes = "1.*"
+serde = { version="1.*", features=["derive"] }
+bendy = { version = "^0.3", features = ["std", "serde"] }
+tokio-serde = "0.8.0"
