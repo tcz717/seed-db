@@ -1,9 +1,12 @@
 use bendy::value::Value;
 use bytes::BytesMut;
+use core::num::bignum::FullOps;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
+use std::fmt::{Debug, Display};
 use std::net::UdpSocket as StdUdpSocket;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::ops::{Add, Shl, Shr};
 use tokio::io;
 use tokio::net::UdpSocket;
 use tokio_util::codec::Decoder;
@@ -11,10 +14,71 @@ use tokio_util::udp::UdpFramed;
 
 use crate::bencode::BencodeConverter;
 
-pub type DhtNodeId = [u8; 20];
+#[derive(PartialEq, Eq, PartialOrd, Ord, Default, Clone)]
+pub struct DhtNodeId([u8; 20]);
+
+impl DhtNodeId {
+    pub fn zered() -> Self {
+        Default::default()
+    }
+
+    pub fn max() -> Self {
+        DhtNodeId([u8::MAX; 20])
+    }
+}
+
+impl Shr<usize> for &DhtNodeId {
+    type Output = DhtNodeId;
+
+    fn shr(self, rhs: usize) -> Self::Output {
+        const WIDTH: usize = u8::BITS as usize;
+        const LEN: usize = 20;
+        let shift = rhs % WIDTH;
+        let limbshift = rhs / WIDTH;
+        let mut res = self.clone();
+        for i in (limbshift + 1..LEN).rev() {
+            res.0[i] =
+                (res.0[i - limbshift] >> shift) | (res.0[i - 1 - limbshift] << (WIDTH - shift));
+        }
+        res.0[limbshift] = res.0[0] >> shift;
+        res.0[..limbshift - 1].fill(0);
+        res
+    }
+}
+
+impl Add for &DhtNodeId {
+    type Output = DhtNodeId;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let mut res: Self::Output = Default::default();
+        let mut carry = 0;
+        for i in (0..20).rev() {
+            let sum = (self.0[i] as u16) + (rhs.0[i] as u16 + carry);
+            res.0[i] = (sum % 256) as u8;
+            carry = sum / 256;
+        }
+        res
+    }
+}
+
+impl Debug for DhtNodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for i in self.0 {
+            write!(f, "{:02X}", i)?
+        }
+        Ok(())
+    }
+}
+
+impl Display for DhtNodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", base64::encode(self.0))
+    }
+}
+
 pub struct DhtNode {
-    id: DhtNodeId,
-    addr: SocketAddr,
+    pub id: Box<DhtNodeId>,
+    pub addr: SocketAddr,
 }
 
 pub trait RouteTable {
@@ -138,7 +202,7 @@ impl<'a> DhtQuery<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::dht::{DhtQuery, DhtResponse, GetPeersResult, KRpc};
+    use crate::dht::{DhtNodeId, DhtQuery, DhtResponse, GetPeersResult, KRpc};
 
     #[test]
     fn deserialize_ping_query() {
@@ -193,5 +257,32 @@ mod tests {
             bytes,
             "d1:rd2:id20:abcdefghij01234567895:token8:aoeusnth6:valuesl6:axje.u6:idhtnmee1:t2:aa1:y1:re".as_bytes()
         );
+    }
+
+    #[test]
+    fn dhtnodeid_ord() {
+        let mut small = [0; 20];
+        small[1] = 1;
+        let mut big = [0; 20];
+        big[0] = 1;
+        assert!(DhtNodeId(small) < DhtNodeId(big))
+    }
+
+    #[test]
+    fn dhtnodeid_shr() {
+        let num = 10934272u32;
+        let origin = DhtNodeId({
+            let mut tmp = [0; 20];
+            tmp[..4].copy_from_slice(&num.to_be_bytes());
+            tmp
+        });
+
+        let moved = DhtNodeId({
+            let mut tmp = [0; 20];
+            tmp[..4].copy_from_slice(&(num >> 10).to_be_bytes());
+            tmp
+        });
+
+        assert_eq!(&origin >> 10, moved);
     }
 }
