@@ -15,14 +15,17 @@ pub mod kademila {
                 root: KBucket::new(),
             }
         }
+
+        pub(crate) fn inorder_dump(&self)->Vec<DhtNodeId>{
+            vec![]
+        }
     }
 
     impl<const K: usize> RouteTable for KademilaRouter<K> {
         fn update(&mut self, node: DhtNode) {
             let mut bucket = &mut self.root;
-            let mut left = DhtNodeId::zered();
-            let mut right = DhtNodeId::max();
-            let mut split_point = (&left >> 1) + (&right >> 1);
+            let mut depth = 0;
+            let mut split_point = DhtNodeId::zered();
 
             loop {
                 match bucket {
@@ -38,14 +41,21 @@ pub mod kademila {
                             *last_modified = SystemTime::now();
                             return;
                         }
-                        if self.id >= left && self.id <= right {
-                            bucket.split(&split_point)
+                        if depth == 0 || self.id.bit(depth - 1) == node.id.bit(depth - 1) {
+                            split_point.set(depth);
+                            bucket.split(&split_point);
                         } else {
                             return;
                         }
                     }
                     KBucket::Branch { low, high } => {
-                        todo!()
+                        if node.id.bit(depth) {
+                            bucket = high;
+                        } else {
+                            bucket = low;
+                        }
+                        split_point.write(depth, self.id.bit(depth));
+                        depth += 1;
                     }
                 }
             }
@@ -103,9 +113,44 @@ pub mod kademila {
                 _ => (),
             }
         }
+    }
+}
 
-        pub fn update(&mut self, node: DhtNode) {
-            todo!()
-        }
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    use crate::dht::{DhtNode, DhtNodeId, RouteTable};
+
+    use super::kademila::KademilaRouter;
+
+    fn create_test_node(f: impl Fn(&mut [u8; 20])) -> DhtNode {
+        let id = DhtNodeId::new(&{
+            let mut bytes = [0u8; 20];
+            f(&mut bytes);
+            bytes
+        });
+        DhtNode::new(
+            id,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
+        )
+    }
+
+    #[test]
+    fn kbucket_update() {
+        let node = DhtNodeId::new(&{
+            let mut bytes = [0u8; 20];
+            bytes[0] = 0b10101;
+            bytes
+        });
+        let mut router = KademilaRouter::<2>::new(node);
+
+        router.update(create_test_node(|bytes| bytes[0] = 0b10101));
+        router.update(create_test_node(|bytes| bytes[0] = 0b00100));
+        router.update(create_test_node(|bytes| bytes[0] = 0b10100));
+        router.update(create_test_node(|bytes| bytes[0] = 0b11100));
+        router.update(create_test_node(|bytes| bytes[0] = 0b10001));
+        router.update(create_test_node(|bytes| bytes[0] = 0b10000));
+        router.update(create_test_node(|bytes| bytes[0] = 0b10010));
     }
 }

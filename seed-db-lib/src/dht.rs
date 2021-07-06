@@ -1,6 +1,5 @@
 use bendy::value::Value;
 use bytes::BytesMut;
-use core::num::bignum::FullOps;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
@@ -18,12 +17,44 @@ use crate::bencode::BencodeConverter;
 pub struct DhtNodeId([u8; 20]);
 
 impl DhtNodeId {
+    pub const BITS: u32 = u8::BITS * 20;
+    pub fn new(bytes: &[u8; 20]) -> Self {
+        DhtNodeId(bytes.clone())
+    }
     pub fn zered() -> Self {
         Default::default()
     }
 
     pub fn max() -> Self {
         DhtNodeId([u8::MAX; 20])
+    }
+
+    pub fn set(&mut self, idx: usize) {
+        const WIDTH: usize = u8::BITS as usize;
+        let bit = 1 << (idx % WIDTH);
+        let byte = 19 - idx / WIDTH;
+        self.0[byte] |= bit;
+    }
+    pub fn unset(&mut self, idx: usize) {
+        const WIDTH: usize = u8::BITS as usize;
+        let bit = 1 << (idx % WIDTH);
+        let byte = 19 - idx / WIDTH;
+        self.0[byte] &= !bit;
+    }
+
+    pub fn bit(&self, idx: usize) -> bool {
+        const WIDTH: usize = u8::BITS as usize;
+        let bit = 1 << (idx % WIDTH);
+        let byte = 19 - idx / WIDTH;
+        self.0[byte] & bit > 0
+    }
+
+    pub fn write(&mut self, idx: usize, val: bool) {
+        const WIDTH: usize = u8::BITS as usize;
+        let bit = 1 << (idx % WIDTH);
+        let byte = 19 - idx / WIDTH;
+        self.0[byte] &= !bit;
+        self.0[byte] |= if val { 1 << (idx % WIDTH) } else { 0 }
     }
 }
 
@@ -79,6 +110,15 @@ impl Display for DhtNodeId {
 pub struct DhtNode {
     pub id: Box<DhtNodeId>,
     pub addr: SocketAddr,
+}
+
+impl DhtNode {
+    pub fn new(id: DhtNodeId, addr: SocketAddr) -> Self {
+        Self {
+            id: Box::new(id),
+            addr,
+        }
+    }
 }
 
 pub trait RouteTable {
@@ -284,5 +324,14 @@ mod tests {
         });
 
         assert_eq!(&origin >> 10, moved);
+    }
+
+    #[test]
+    fn dhtnodeid_write() {
+        let mut origin = DhtNodeId([0b111; 20]);
+        let mut expected = [0b111; 20];
+        expected[0] = 0b101;
+        origin.write(153, false);
+        assert_eq!(origin, DhtNodeId(expected));
     }
 }
