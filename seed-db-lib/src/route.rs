@@ -1,5 +1,5 @@
 pub mod kademila {
-    use std::{collections::LinkedList, time::SystemTime};
+    use std::{collections::LinkedList, fmt::Debug, time::SystemTime};
 
     use crate::dht::{DhtNode, DhtNodeId, RouteTable};
 
@@ -16,15 +16,35 @@ pub mod kademila {
             }
         }
 
-        pub(crate) fn inorder_dump(&self)->Vec<DhtNodeId>{
-            vec![]
+        pub(crate) fn inorder_dump(&self) -> Vec<DhtNodeId> {
+            let mut ids = vec![];
+            Self::dfs(&self.root, &mut ids);
+            ids
+        }
+
+        fn dfs(bucket: &KBucket<K>, ids: &mut Vec<DhtNodeId>) {
+            match bucket {
+                KBucket::Bucket { nodes, .. } => {
+                    ids.extend(nodes.iter().map(|n| n.id.as_ref().clone()));
+                }
+                KBucket::Branch { low, high } => {
+                    Self::dfs(low.as_ref(), ids);
+                    Self::dfs(high.as_ref(), ids);
+                }
+            };
+        }
+
+        /// Get a reference to the kademila router's root.
+        pub fn root(&self) -> &KBucket<K> {
+            &self.root
         }
     }
 
     impl<const K: usize> RouteTable for KademilaRouter<K> {
         fn update(&mut self, node: DhtNode) {
+            const ROOT_DEPTH: usize = (DhtNodeId::BITS - 1) as usize;
             let mut bucket = &mut self.root;
-            let mut depth = 0;
+            let mut depth = ROOT_DEPTH;
             let mut split_point = DhtNodeId::zered();
 
             loop {
@@ -41,7 +61,7 @@ pub mod kademila {
                             *last_modified = SystemTime::now();
                             return;
                         }
-                        if depth == 0 || self.id.bit(depth - 1) == node.id.bit(depth - 1) {
+                        if depth == ROOT_DEPTH || self.id.bit(depth + 1) == node.id.bit(depth + 1) {
                             split_point.set(depth);
                             bucket.split(&split_point);
                         } else {
@@ -55,7 +75,7 @@ pub mod kademila {
                             bucket = low;
                         }
                         split_point.write(depth, self.id.bit(depth));
-                        depth += 1;
+                        depth -= 1;
                     }
                 }
             }
@@ -67,8 +87,13 @@ pub mod kademila {
         {
             todo!()
         }
+
+        fn id(&self) -> &DhtNodeId {
+            &self.id
+        }
     }
 
+    #[derive(Debug)]
     pub enum KBucket<const K: usize> {
         Bucket {
             nodes: LinkedList<DhtNode>,
@@ -152,5 +177,21 @@ mod tests {
         router.update(create_test_node(|bytes| bytes[0] = 0b10001));
         router.update(create_test_node(|bytes| bytes[0] = 0b10000));
         router.update(create_test_node(|bytes| bytes[0] = 0b10010));
+
+        let ids = router.inorder_dump();
+
+        println!("{:#?}", router.root());
+
+        assert!(
+            ids.iter()
+                .fold((None, true), |(last, inc), id| {
+                    if let Some(last) = last {
+                        return (Some(id), inc && last <= id);
+                    } else {
+                        return (Some(id), inc);
+                    }
+                })
+                .1
+        )
     }
 }

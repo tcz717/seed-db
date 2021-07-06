@@ -1,5 +1,6 @@
 use bendy::value::Value;
 use bytes::BytesMut;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
@@ -8,12 +9,13 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::{Add, Shl, Shr};
 use tokio::io;
 use tokio::net::UdpSocket;
+use tokio::net::{lookup_host, ToSocketAddrs};
 use tokio_util::codec::Decoder;
 use tokio_util::udp::UdpFramed;
 
 use crate::bencode::BencodeConverter;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Default, Clone)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Default, Clone, Serialize, Deserialize)]
 pub struct DhtNodeId([u8; 20]);
 
 impl DhtNodeId {
@@ -95,7 +97,7 @@ impl Add for &DhtNodeId {
 impl Debug for DhtNodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for i in self.0 {
-            write!(f, "{:02X}", i)?
+            write!(f, "{:02X} ", i)?
         }
         Ok(())
     }
@@ -107,6 +109,13 @@ impl Display for DhtNodeId {
     }
 }
 
+impl AsRef<[u8; 20]> for DhtNodeId {
+    fn as_ref(&self) -> &[u8; 20] {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
 pub struct DhtNode {
     pub id: Box<DhtNodeId>,
     pub addr: SocketAddr,
@@ -122,21 +131,45 @@ impl DhtNode {
 }
 
 pub trait RouteTable {
+    fn id(&self) -> &DhtNodeId;
     fn update(&mut self, node: DhtNode);
     fn get_nearests<I>(&self, id: &DhtNodeId) -> I
     where
         I: Iterator<Item = DhtNode>;
 }
 
-struct DhtClient {
+pub struct DhtClient<R: RouteTable> {
     udp: UdpSocket,
+    trackers: Vec<SocketAddr>,
+    router: R,
+    next_transaction_id: u16,
 }
 
-impl DhtClient {
-    pub fn new_from_trackers(trackers: ()) -> Result<DhtClient, std::io::Error> {
+impl<R: RouteTable + Default> DhtClient<R> {
+    pub fn new() -> Result<Self, std::io::Error> {
         let socket: StdUdpSocket = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 5717))?;
         let socket: UdpSocket = UdpSocket::from_std(socket)?;
-        Ok(DhtClient { udp: socket })
+        Ok(DhtClient {
+            udp: socket,
+            trackers: vec![],
+            router: Default::default(),
+            next_transaction_id: Default::default(),
+        })
+    }
+}
+
+impl<R: RouteTable> DhtClient<R> {
+    pub async fn add_trackers<T>(&mut self, trackers: &[T]) -> usize
+    where
+        T: ToSocketAddrs + Clone,
+    {
+        let old_size = self.trackers.len();
+        for tracker in trackers {
+            if let Ok(addrs) = lookup_host(tracker).await {
+                self.trackers.extend(addrs);
+            }
+        }
+        self.trackers.len() - old_size
     }
 
     pub async fn run(&mut self) -> Result<(), std::io::Error> {
@@ -145,9 +178,31 @@ impl DhtClient {
             let (len, addr) = self.udp.recv_from(&mut buf).await?;
             println!("{:?} bytes received from {:?}", len, addr);
 
+            if let Ok(packet) = bendy::serde::from_bytes::<'_, KRpc<'_>>(&buf[..len]) {
+                println!("{:#?} packet received", packet);
+            } else {
+                println!("Unknown packet received from {:?}", addr);
+            }
+
             let len = self.udp.send_to(&buf[..len], addr).await?;
             println!("{:?} bytes sent", len);
         }
+    }
+
+    pub async fn find_node(&mut self, target_addr: &SocketAddr) -> Result<(), std::io::Error> {
+        let random_target = DhtNodeId::max();
+        let query = KRpc::Query {
+            transaction_id: &self.next_transaction_id.to_be_bytes(),
+            query: DhtQuery::FindNode {
+                id: self.router.id().as_ref(),
+                target: random_target.as_ref(),
+            },
+        };
+        self.udp
+            .send_to(&bendy::serde::to_bytes(&query).unwrap(), target_addr)
+            .await?;
+        self.next_transaction_id += 1;
+        Ok(())
     }
 }
 
@@ -157,21 +212,24 @@ pub enum KRpc<'a> {
     #[serde(rename = "q")]
     Query {
         #[serde(rename = "t")]
-        transaction_id: &'a str,
+        #[serde(with = "serde_bytes")]
+        transaction_id: &'a [u8],
         #[serde(flatten)]
         query: DhtQuery<'a>,
     },
     #[serde(rename = "r")]
     Response {
         #[serde(rename = "t")]
-        transaction_id: &'a str,
+        #[serde(with = "serde_bytes")]
+        transaction_id: &'a [u8],
         #[serde(rename = "r")]
         response: DhtResponse<'a>,
     },
     #[serde(rename = "e")]
     Error {
         #[serde(rename = "t")]
-        transaction_id: &'a str,
+        #[serde(with = "serde_bytes")]
+        transaction_id: &'a [u8],
         #[serde(rename = "e")]
         error: (i32, &'a str),
     },
@@ -182,50 +240,62 @@ pub enum KRpc<'a> {
 #[serde(tag = "q", content = "a")]
 pub enum DhtQuery<'a> {
     AnnouncePeer {
-        id: &'a str,
+        #[serde(with = "serde_bytes")]
+        id: &'a [u8],
         #[serde(default)]
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(serialize_with = "DhtQuery::serialize_implied_port")]
         implied_port: Option<bool>,
-        info_hash: &'a str,
+        #[serde(with = "serde_bytes")]
+        info_hash: &'a [u8],
         port: u16,
         token: &'a str,
     },
     FindNode {
-        id: &'a str,
-        info_hash: &'a str,
+        #[serde(with = "serde_bytes")]
+        id: &'a [u8],
+        #[serde(with = "serde_bytes")]
+        target: &'a [u8],
     },
     GetPeers {
-        id: &'a str,
-        target: &'a str,
+        #[serde(with = "serde_bytes")]
+        id: &'a [u8],
+        #[serde(with = "serde_bytes")]
+        info_hash: &'a [u8],
     },
     Ping {
-        id: &'a str,
+        #[serde(with = "serde_bytes")]
+        id: &'a [u8],
     },
 }
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 #[serde(untagged)]
 pub enum DhtResponse<'a> {
     FindNode {
-        id: &'a str,
-        nodes: &'a str,
+        #[serde(with = "serde_bytes")]
+        id: &'a [u8],
+        #[serde(with = "serde_bytes")]
+        nodes: &'a [u8],
     },
     GetPeers {
-        id: &'a str,
+        #[serde(with = "serde_bytes")]
+        id: &'a [u8],
         token: &'a str,
         #[serde(flatten)]
         result: GetPeersResult<'a>,
     },
     PingOrAnnouncePeer {
-        id: &'a str,
+        #[serde(with = "serde_bytes")]
+        id: &'a [u8],
     },
 }
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum GetPeersResult<'a> {
     #[serde(rename = "values")]
-    Found(Vec<&'a str>),
+    Found(Vec<&'a [u8]>),
     #[serde(rename = "nodes")]
-    NotFound(&'a str),
+    #[serde(with = "serde_bytes")]
+    NotFound(&'a [u8]),
 }
 
 impl<'a> DhtQuery<'a> {
@@ -247,9 +317,9 @@ mod tests {
     #[test]
     fn deserialize_ping_query() {
         let query = KRpc::Query {
-            transaction_id: "aa",
+            transaction_id: b"aa",
             query: DhtQuery::Ping {
-                id: "abcdefghij0123456789",
+                id: b"abcdefghij0123456789",
             },
         };
         let bytes = bendy::serde::to_bytes(&query).unwrap();
@@ -263,11 +333,11 @@ mod tests {
     #[test]
     fn deserialize_announce_peer_query() {
         let query = KRpc::Query {
-            transaction_id: "aa",
+            transaction_id: b"aa",
             query: DhtQuery::AnnouncePeer {
-                id: "abcdefghij0123456789",
+                id: b"abcdefghij0123456789",
                 implied_port: Some(true),
-                info_hash: "mnopqrstuvwxyz123456",
+                info_hash: b"mnopqrstuvwxyz123456",
                 port: 6881,
                 token: "aoeusnth",
             },
@@ -283,10 +353,10 @@ mod tests {
     #[test]
     fn deserialize_get_peers_response() {
         let query = KRpc::Response {
-            transaction_id: "aa",
+            transaction_id: b"aa",
             response: DhtResponse::GetPeers {
-                id: "abcdefghij0123456789",
-                result: GetPeersResult::Found(vec!["axje.u", "idhtnm"]),
+                id: b"abcdefghij0123456789",
+                result: GetPeersResult::Found(vec![b"axje.u", b"idhtnm"]),
                 token: "aoeusnth",
             },
         };

@@ -14,3 +14,5 @@ serde = { version="1.*", features=["derive"] }
 bendy = { version = "^0.3", features = ["std", "serde"] }
 tokio-serde = "0.8.0"
 base64 = "0.*"
+futures = "0.*"
+serde_bytes = "0.*"
