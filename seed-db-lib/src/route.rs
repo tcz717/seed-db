@@ -40,6 +40,15 @@ pub mod kademila {
         }
     }
 
+    impl<const K: usize> Default for KademilaRouter<K> {
+        fn default() -> Self {
+            Self {
+                id: DhtNodeId::random(),
+                root: KBucket::new(),
+            }
+        }
+    }
+
     impl<const K: usize> RouteTable for KademilaRouter<K> {
         fn update(&mut self, node: DhtNode) {
             const ROOT_DEPTH: usize = (DhtNodeId::BITS - 1) as usize;

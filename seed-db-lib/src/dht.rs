@@ -1,21 +1,24 @@
-use bendy::value::Value;
-use bytes::BytesMut;
-use futures::StreamExt;
+use itertools::Itertools;
+use serde::de::Visitor;
 use serde::{Deserialize, Serialize, Serializer};
-use std::collections::HashMap;
+use tokio::spawn;
+use tokio::sync::mpsc;
+
+use std::convert::{TryFrom, TryInto};
 use std::fmt::{Debug, Display};
+use std::mem::size_of;
 use std::net::UdpSocket as StdUdpSocket;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::ops::{Add, Shl, Shr};
-use tokio::io;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::net::{lookup_host, ToSocketAddrs};
-use tokio_util::codec::Decoder;
-use tokio_util::udp::UdpFramed;
 
-use crate::bencode::BencodeConverter;
+use self::utils::{BytesSliceVisitor, BytesVisitor};
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Default, Clone, Serialize, Deserialize)]
+mod utils;
+
+#[repr(transparent)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Default, Clone, Hash)]
 pub struct DhtNodeId([u8; 20]);
 
 impl DhtNodeId {
@@ -29,6 +32,10 @@ impl DhtNodeId {
 
     pub fn max() -> Self {
         DhtNodeId([u8::MAX; 20])
+    }
+
+    pub fn random() -> Self {
+        DhtNodeId(rand::random())
     }
 
     pub fn set(&mut self, idx: usize) {
@@ -60,40 +67,6 @@ impl DhtNodeId {
     }
 }
 
-impl Shr<usize> for &DhtNodeId {
-    type Output = DhtNodeId;
-
-    fn shr(self, rhs: usize) -> Self::Output {
-        const WIDTH: usize = u8::BITS as usize;
-        const LEN: usize = 20;
-        let shift = rhs % WIDTH;
-        let limbshift = rhs / WIDTH;
-        let mut res = self.clone();
-        for i in (limbshift + 1..LEN).rev() {
-            res.0[i] =
-                (res.0[i - limbshift] >> shift) | (res.0[i - 1 - limbshift] << (WIDTH - shift));
-        }
-        res.0[limbshift] = res.0[0] >> shift;
-        res.0[..limbshift - 1].fill(0);
-        res
-    }
-}
-
-impl Add for &DhtNodeId {
-    type Output = DhtNodeId;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        let mut res: Self::Output = Default::default();
-        let mut carry = 0;
-        for i in (0..20).rev() {
-            let sum = (self.0[i] as u16) + (rhs.0[i] as u16 + carry);
-            res.0[i] = (sum % 256) as u8;
-            carry = sum / 256;
-        }
-        res
-    }
-}
-
 impl Debug for DhtNodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for i in self.0 {
@@ -115,7 +88,72 @@ impl AsRef<[u8; 20]> for DhtNodeId {
     }
 }
 
-#[derive(Debug)]
+impl Into<DhtNodeId> for &[u8; 20] {
+    fn into(self) -> DhtNodeId {
+        DhtNodeId::new(self)
+    }
+}
+
+impl Serialize for DhtNodeId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DhtNodeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DhtNodeIdVisitor;
+        impl<'de> Visitor<'de> for DhtNodeIdVisitor {
+            type Value = DhtNodeId;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("20 bytes Node ID")
+            }
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(DhtNodeId::new(v.try_into().map_err(|_| {
+                    serde::de::Error::invalid_length(v.len(), &self)
+                })?))
+            }
+        }
+        deserializer.deserialize_bytes(DhtNodeIdVisitor)
+    }
+}
+
+impl<'a, 'de: 'a> Deserialize<'de> for &'a DhtNodeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DhtNodeIdVisitor;
+        impl<'de> Visitor<'de> for DhtNodeIdVisitor {
+            type Value = &'de DhtNodeId;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("20 bytes Node ID")
+            }
+            fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let bytes = TryInto::<&[u8; 20]>::try_into(v)
+                    .map_err(|_| serde::de::Error::invalid_length(v.len(), &self))?;
+                Ok(unsafe { &*(bytes.as_ptr() as *const _) })
+            }
+        }
+        deserializer.deserialize_bytes(DhtNodeIdVisitor)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct DhtNode {
     pub id: Box<DhtNodeId>,
     pub addr: SocketAddr,
@@ -139,7 +177,7 @@ pub trait RouteTable {
 }
 
 pub struct DhtClient<R: RouteTable> {
-    udp: UdpSocket,
+    udp: Arc<UdpSocket>,
     trackers: Vec<SocketAddr>,
     router: R,
     next_transaction_id: u16,
@@ -150,7 +188,7 @@ impl<R: RouteTable + Default> DhtClient<R> {
         let socket: StdUdpSocket = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 5717))?;
         let socket: UdpSocket = UdpSocket::from_std(socket)?;
         Ok(DhtClient {
-            udp: socket,
+            udp: socket.into(),
             trackers: vec![],
             router: Default::default(),
             next_transaction_id: Default::default(),
@@ -164,9 +202,11 @@ impl<R: RouteTable> DhtClient<R> {
         T: ToSocketAddrs + Clone,
     {
         let old_size = self.trackers.len();
+        let local = self.udp.local_addr().unwrap();
         for tracker in trackers {
             if let Ok(addrs) = lookup_host(tracker).await {
-                self.trackers.extend(addrs);
+                self.trackers
+                    .extend(addrs.filter(|addr| addr.is_ipv4() == local.is_ipv4()));
             }
         }
         self.trackers.len() - old_size
@@ -174,27 +214,55 @@ impl<R: RouteTable> DhtClient<R> {
 
     pub async fn run(&mut self) -> Result<(), std::io::Error> {
         let mut buf: [u8; 1024] = [0; 1024];
+        let (find_node, rx) = mpsc::channel::<SocketAddr>(128);
+        Self::find_node_handler(self.router.id().clone(), self.udp.clone(), rx);
+
+        for tracker in self.trackers.clone().iter() {
+            self.find_node(tracker).await?;
+        }
+
         loop {
             let (len, addr) = self.udp.recv_from(&mut buf).await?;
             println!("{:?} bytes received from {:?}", len, addr);
 
             if let Ok(packet) = bendy::serde::from_bytes::<'_, KRpc<'_>>(&buf[..len]) {
                 println!("{:#?} packet received", packet);
+                match packet {
+                    KRpc::Query {
+                        transaction_id,
+                        query,
+                    } => todo!(),
+                    KRpc::Response {
+                        transaction_id,
+                        response,
+                    } => match response {
+                        DhtResponse::FindNode { id, nodes } => {
+                            let node = DhtNode::new(id.clone(), addr.clone());
+                            println!("Updating Node {:?}", &node);
+                            self.router.update(node);
+
+                            for new_node in nodes.nodes().unique() {
+                                let _ = find_node.try_send(new_node.addr());
+                            }
+                        }
+                        DhtResponse::GetPeers { id, token, result } => todo!(),
+                        DhtResponse::PingOrAnnouncePeer { id } => {}
+                    },
+                    _ => (),
+                }
             } else {
                 println!("Unknown packet received from {:?}", addr);
             }
-
-            let len = self.udp.send_to(&buf[..len], addr).await?;
-            println!("{:?} bytes sent", len);
         }
     }
 
     pub async fn find_node(&mut self, target_addr: &SocketAddr) -> Result<(), std::io::Error> {
-        let random_target = DhtNodeId::max();
+        println!("Sending find_node to {}", target_addr);
+        let random_target = DhtNodeId::random();
         let query = KRpc::Query {
             transaction_id: &self.next_transaction_id.to_be_bytes(),
             query: DhtQuery::FindNode {
-                id: self.router.id().as_ref(),
+                id: self.router.id(),
                 target: random_target.as_ref(),
             },
         };
@@ -203,6 +271,34 @@ impl<R: RouteTable> DhtClient<R> {
             .await?;
         self.next_transaction_id += 1;
         Ok(())
+    }
+
+    fn find_node_handler(
+        myid: DhtNodeId,
+        socket: Arc<UdpSocket>,
+        mut rt: mpsc::Receiver<SocketAddr>,
+    ) {
+        spawn(async move {
+            let mut next_transaction_id: u16 = 0;
+            while let Some(addr) = rt.recv().await {
+                println!("Sending find_node to {}", addr);
+                let random_target = DhtNodeId::random();
+                let query = KRpc::Query {
+                    transaction_id: &next_transaction_id.to_be_bytes(),
+                    query: DhtQuery::FindNode {
+                        id: &myid,
+                        target: random_target.as_ref(),
+                    },
+                };
+                if let Err(err) = socket
+                    .send_to(&bendy::serde::to_bytes(&query).unwrap(), addr)
+                    .await
+                {
+                    println!("Failed to send find_node: {}", err)
+                }
+                next_transaction_id += 1;
+            }
+        });
     }
 }
 
@@ -240,8 +336,7 @@ pub enum KRpc<'a> {
 #[serde(tag = "q", content = "a")]
 pub enum DhtQuery<'a> {
     AnnouncePeer {
-        #[serde(with = "serde_bytes")]
-        id: &'a [u8],
+        id: &'a DhtNodeId,
         #[serde(default)]
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(serialize_with = "DhtQuery::serialize_implied_port")]
@@ -252,50 +347,43 @@ pub enum DhtQuery<'a> {
         token: &'a str,
     },
     FindNode {
-        #[serde(with = "serde_bytes")]
-        id: &'a [u8],
+        id: &'a DhtNodeId,
         #[serde(with = "serde_bytes")]
         target: &'a [u8],
     },
     GetPeers {
-        #[serde(with = "serde_bytes")]
-        id: &'a [u8],
+        id: &'a DhtNodeId,
         #[serde(with = "serde_bytes")]
         info_hash: &'a [u8],
     },
     Ping {
-        #[serde(with = "serde_bytes")]
-        id: &'a [u8],
+        id: &'a DhtNodeId,
     },
 }
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 #[serde(untagged)]
 pub enum DhtResponse<'a> {
     FindNode {
-        #[serde(with = "serde_bytes")]
-        id: &'a [u8],
-        #[serde(with = "serde_bytes")]
-        nodes: &'a [u8],
+        id: &'a DhtNodeId,
+        nodes: DhtNodeCompactList<'a>,
     },
     GetPeers {
-        #[serde(with = "serde_bytes")]
-        id: &'a [u8],
+        id: &'a DhtNodeId,
         token: &'a str,
         #[serde(flatten)]
         result: GetPeersResult<'a>,
     },
     PingOrAnnouncePeer {
-        #[serde(with = "serde_bytes")]
-        id: &'a [u8],
+        id: &'a DhtNodeId,
     },
 }
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum GetPeersResult<'a> {
     #[serde(rename = "values")]
-    Found(Vec<&'a [u8]>),
+    Found(Vec<DhtNodeId>),
     #[serde(rename = "nodes")]
-    #[serde(with = "serde_bytes")]
-    NotFound(&'a [u8]),
+    #[serde(borrow)]
+    NotFound(DhtNodeCompactList<'a>),
 }
 
 impl<'a> DhtQuery<'a> {
@@ -310,6 +398,119 @@ impl<'a> DhtQuery<'a> {
     }
 }
 
+#[derive(PartialEq)]
+pub struct DhtNodeCompactList<'a>(&'a [u8]);
+
+impl<'a> DhtNodeCompactList<'a> {
+    pub fn nodes(&self) -> impl Iterator<Item = &DhtNodeCompact> {
+        self.0
+            .chunks_exact(size_of::<DhtNodeCompact>())
+            .map(|bytes| unsafe { &*(bytes.as_ptr() as *const _) })
+    }
+}
+
+impl<'a> Debug for DhtNodeCompactList<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.nodes()).finish()
+    }
+}
+
+impl<'a> Serialize for DhtNodeCompactList<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for DhtNodeCompactList<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = deserializer.deserialize_bytes(BytesSliceVisitor)?;
+        if bytes.len() % size_of::<DhtNodeCompact>() != 0 {
+            Err(serde::de::Error::invalid_length(
+                bytes.len(),
+                &"Bytes size must be n times of DhtNodeCompact",
+            ))
+        } else {
+            Ok(DhtNodeCompactList(bytes))
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub struct DhtNodeCompact([u8; 26]);
+
+impl DhtNodeCompact {
+    fn addr(&self) -> SocketAddr {
+        SocketAddr::from((
+            Ipv4Addr::from(<&[u8; 4]>::try_from(&self.0[20..24]).unwrap().to_owned()),
+            u16::from_be_bytes(self.0[24..26].try_into().unwrap()),
+        ))
+    }
+}
+
+impl Into<DhtNode> for &DhtNodeCompact {
+    fn into(self) -> DhtNode {
+        DhtNode {
+            id: Box::new(DhtNodeId::new(self.0[0..20].try_into().unwrap())),
+            addr: SocketAddr::from((
+                Ipv4Addr::from(<&[u8; 4]>::try_from(&self.0[20..24]).unwrap().to_owned()),
+                u16::from_be_bytes(self.0[24..26].try_into().unwrap()),
+            )),
+        }
+    }
+}
+
+impl Debug for DhtNodeCompact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DhtNodeCompact")
+            .field("id", &base64::encode(&self.0[0..20]))
+            .field(
+                "addr",
+                &SocketAddr::from((
+                    Ipv4Addr::from(<&[u8; 4]>::try_from(&self.0[20..24]).unwrap().to_owned()),
+                    u16::from_be_bytes(self.0[24..26].try_into().unwrap()),
+                )),
+            )
+            .finish()
+    }
+}
+
+impl Serialize for DhtNodeCompact {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DhtNodeCompact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_bytes(BytesVisitor::<26>)
+            .map(DhtNodeCompact)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for &'a DhtNodeCompact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_bytes(BytesVisitor::<26>)
+            .map(|bytes| unsafe { &*(bytes.as_ptr() as *const _) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::dht::{DhtNodeId, DhtQuery, DhtResponse, GetPeersResult, KRpc};
@@ -319,7 +520,7 @@ mod tests {
         let query = KRpc::Query {
             transaction_id: b"aa",
             query: DhtQuery::Ping {
-                id: b"abcdefghij0123456789",
+                id: &b"abcdefghij0123456789".into(),
             },
         };
         let bytes = bendy::serde::to_bytes(&query).unwrap();
@@ -335,7 +536,7 @@ mod tests {
         let query = KRpc::Query {
             transaction_id: b"aa",
             query: DhtQuery::AnnouncePeer {
-                id: b"abcdefghij0123456789",
+                id: &b"abcdefghij0123456789".into(),
                 implied_port: Some(true),
                 info_hash: b"mnopqrstuvwxyz123456",
                 port: 6881,
@@ -355,8 +556,11 @@ mod tests {
         let query = KRpc::Response {
             transaction_id: b"aa",
             response: DhtResponse::GetPeers {
-                id: b"abcdefghij0123456789",
-                result: GetPeersResult::Found(vec![b"axje.u", b"idhtnm"]),
+                id: &b"abcdefghij0123456789".into(),
+                result: GetPeersResult::Found(vec![
+                    b"01234567890123456789".into(),
+                    b"a1234567890123456789".into(),
+                ]),
                 token: "aoeusnth",
             },
         };
@@ -365,7 +569,7 @@ mod tests {
         println!("{}", std::str::from_utf8(&bytes).unwrap());
         assert_eq!(
             bytes,
-            "d1:rd2:id20:abcdefghij01234567895:token8:aoeusnth6:valuesl6:axje.u6:idhtnmee1:t2:aa1:y1:re".as_bytes()
+            "d1:rd2:id20:abcdefghij01234567895:token8:aoeusnth6:valuesl20:0123456789012345678920:a1234567890123456789ee1:t2:aa1:y1:re".as_bytes()
         );
     }
 
@@ -376,24 +580,6 @@ mod tests {
         let mut big = [0; 20];
         big[0] = 1;
         assert!(DhtNodeId(small) < DhtNodeId(big))
-    }
-
-    #[test]
-    fn dhtnodeid_shr() {
-        let num = 10934272u32;
-        let origin = DhtNodeId({
-            let mut tmp = [0; 20];
-            tmp[..4].copy_from_slice(&num.to_be_bytes());
-            tmp
-        });
-
-        let moved = DhtNodeId({
-            let mut tmp = [0; 20];
-            tmp[..4].copy_from_slice(&(num >> 10).to_be_bytes());
-            tmp
-        });
-
-        assert_eq!(&origin >> 10, moved);
     }
 
     #[test]
