@@ -18,6 +18,7 @@ serde_bytes = "0.*"
 rand = "0.*"
 rupnp = "1.*"
 itertools = "0.*"
+log = "0.*"
 
 [dev-dependencies]
 tokio = { version="1.*", features=["net", "rt", "macros"] }

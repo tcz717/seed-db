@@ -1,11 +1,13 @@
 pub mod kademila {
-    use std::{collections::LinkedList, fmt::Debug, time::SystemTime};
+    use std::{collections::LinkedList, fmt::Debug, mem::size_of, time::SystemTime};
 
     use crate::dht::{DhtNode, DhtNodeId, RouteTable};
 
     pub struct KademilaRouter<const K: usize> {
         id: DhtNodeId,
         root: KBucket<K>,
+        node_count: usize,
+        bucket_count: usize,
     }
 
     impl<const K: usize> KademilaRouter<K> {
@@ -13,15 +15,19 @@ pub mod kademila {
             Self {
                 id,
                 root: KBucket::new(),
+                node_count: 0,
+                bucket_count: 1,
             }
         }
 
+        #[cfg(test)]
         pub(crate) fn inorder_dump(&self) -> Vec<DhtNodeId> {
             let mut ids = vec![];
             Self::dfs(&self.root, &mut ids);
             ids
         }
 
+        #[cfg(test)]
         fn dfs(bucket: &KBucket<K>, ids: &mut Vec<DhtNodeId>) {
             match bucket {
                 KBucket::Bucket { nodes, .. } => {
@@ -32,6 +38,35 @@ pub mod kademila {
                     Self::dfs(high.as_ref(), ids);
                 }
             };
+        }
+
+        fn nearests_core(
+            bucket: &KBucket<K>,
+            target: &DhtNodeId,
+            bit: impl Iterator<Item = bool>,
+            nodes: &mut Vec<&DhtNode>,
+        ) {
+            match bucket {
+                KBucket::Bucket {
+                    nodes,
+                    last_modified,
+                } => {
+                    let remaining = K - nodes.len();
+                    // let mut take_k = nodes.iter().take(remaining);
+                    nodes.extend(nodes.iter().take(remaining));
+                }
+                KBucket::Branch { low, high } => {
+                    let (first, second) = if bit.next().expect("") {
+                        (high, low)
+                    } else {
+                        (low, high)
+                    };
+                    Self::nearests_core(first, target, bit, nodes);
+                    if nodes.len() < K {
+                        Self::nearests_core(second, target, bit, nodes);
+                    }
+                }
+            }
         }
 
         /// Get a reference to the kademila router's root.
@@ -45,6 +80,8 @@ pub mod kademila {
             Self {
                 id: DhtNodeId::random(),
                 root: KBucket::new(),
+                node_count: 0,
+                bucket_count: 1,
             }
         }
     }
@@ -62,17 +99,25 @@ pub mod kademila {
                         nodes,
                         last_modified,
                     } => {
-                        if nodes.len() < K {
-                            match nodes.iter_mut().find(|n| n.id == node.id) {
-                                Some(n) => *n = node,
-                                None => nodes.push_front(node),
+                        match nodes.iter_mut().find(|n| n.id == node.id) {
+                            Some(n) => {
+                                *n = node;
+                                *last_modified = SystemTime::now();
+                                return;
                             }
-                            *last_modified = SystemTime::now();
-                            return;
+                            None => {
+                                if nodes.len() < K {
+                                    nodes.push_front(node);
+                                    self.node_count += 1;
+                                    *last_modified = SystemTime::now();
+                                    return;
+                                }
+                            }
                         }
                         if depth == ROOT_DEPTH || self.id.bit(depth + 1) == node.id.bit(depth + 1) {
                             split_point.set(depth);
                             bucket.split(&split_point);
+                            self.bucket_count += 1;
                         } else {
                             return;
                         }
@@ -90,15 +135,22 @@ pub mod kademila {
             }
         }
 
-        fn get_nearests<I>(&self, id: &DhtNodeId) -> I
-        where
-            I: Iterator<Item = DhtNode>,
-        {
+        fn id(&self) -> &DhtNodeId {
+            &self.id
+        }
+
+        fn nearests(&self, id: &DhtNodeId) -> Vec<&DhtNode> {
+            let mut nodes = Vec::with_capacity(K);
+            Self::nearests_core(&self.root, id, bit, nodes);
+            nodes
+        }
+
+        fn unheathy(&self) -> Box<dyn Iterator<Item = &DhtNode>> {
             todo!()
         }
 
-        fn id(&self) -> &DhtNodeId {
-            &self.id
+        fn clean_unheathy(&mut self) -> Box<dyn Iterator<Item = &DhtNode>> {
+            todo!()
         }
     }
 
