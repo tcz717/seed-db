@@ -1,5 +1,5 @@
 pub mod kademila {
-    use std::{collections::LinkedList, fmt::Debug, mem::size_of, time::SystemTime};
+    use std::{collections::LinkedList, fmt::Debug, time::SystemTime};
 
     use crate::dht::{DhtNode, DhtNodeId, RouteTable};
 
@@ -40,20 +40,16 @@ pub mod kademila {
             };
         }
 
-        fn nearests_core(
-            bucket: &KBucket<K>,
-            target: &DhtNodeId,
-            bit: impl Iterator<Item = bool>,
-            nodes: &mut Vec<&DhtNode>,
+        fn nearests_core<'a>(
+            bucket: &'a KBucket<K>,
+            bit: &mut impl Iterator<Item = bool>,
+            result: &mut Vec<&'a DhtNode>,
         ) {
             match bucket {
-                KBucket::Bucket {
-                    nodes,
-                    last_modified,
-                } => {
+                KBucket::Bucket { nodes, .. } => {
                     let remaining = K - nodes.len();
-                    // let mut take_k = nodes.iter().take(remaining);
-                    nodes.extend(nodes.iter().take(remaining));
+                    let take_k = nodes.iter().take(remaining);
+                    result.extend(take_k);
                 }
                 KBucket::Branch { low, high } => {
                     let (first, second) = if bit.next().expect("") {
@@ -61,9 +57,9 @@ pub mod kademila {
                     } else {
                         (low, high)
                     };
-                    Self::nearests_core(first, target, bit, nodes);
-                    if nodes.len() < K {
-                        Self::nearests_core(second, target, bit, nodes);
+                    Self::nearests_core(first, bit, result);
+                    if result.len() < K {
+                        Self::nearests_core(second, bit, result);
                     }
                 }
             }
@@ -141,7 +137,14 @@ pub mod kademila {
 
         fn nearests(&self, id: &DhtNodeId) -> Vec<&DhtNode> {
             let mut nodes = Vec::with_capacity(K);
-            Self::nearests_core(&self.root, id, bit, nodes);
+            Self::nearests_core(
+                &self.root,
+                &mut id
+                    .as_ref()
+                    .iter()
+                    .flat_map(|b| (0..8).rev().map(move |bit| *b & (1 << bit) > 0)),
+                &mut nodes,
+            );
             nodes
         }
 
@@ -224,6 +227,40 @@ mod tests {
 
     #[test]
     fn kbucket_update() {
+        let node = DhtNodeId::new(&{
+            let mut bytes = [0u8; 20];
+            bytes[0] = 0b10101;
+            bytes
+        });
+        let mut router = KademilaRouter::<2>::new(node);
+
+        router.update(create_test_node(|bytes| bytes[0] = 0b10101));
+        router.update(create_test_node(|bytes| bytes[0] = 0b00100));
+        router.update(create_test_node(|bytes| bytes[0] = 0b10100));
+        router.update(create_test_node(|bytes| bytes[0] = 0b11100));
+        router.update(create_test_node(|bytes| bytes[0] = 0b10001));
+        router.update(create_test_node(|bytes| bytes[0] = 0b10000));
+        router.update(create_test_node(|bytes| bytes[0] = 0b10010));
+
+        let ids = router.inorder_dump();
+
+        println!("{:#?}", router.root());
+
+        assert!(
+            ids.iter()
+                .fold((None, true), |(last, inc), id| {
+                    if let Some(last) = last {
+                        return (Some(id), inc && last <= id);
+                    } else {
+                        return (Some(id), inc);
+                    }
+                })
+                .1
+        )
+    }
+    
+    #[test]
+    fn kbucket_nearests() {
         let node = DhtNodeId::new(&{
             let mut bytes = [0u8; 20];
             bytes[0] = 0b10101;
