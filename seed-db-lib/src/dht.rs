@@ -68,6 +68,19 @@ impl DhtNodeId {
     }
 }
 
+impl std::ops::BitXor for &DhtNodeId {
+    type Output = DhtNodeId;
+
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        let mut result = DhtNodeId::default();
+
+        for (i, byte) in result.0.iter_mut().enumerate() {
+            *byte = self.0[i] ^ rhs.0[i];
+        }
+        result
+    }
+}
+
 impl Debug for DhtNodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for i in self.0 {
@@ -156,7 +169,7 @@ impl<'a, 'de: 'a> Deserialize<'de> for &'a DhtNodeId {
 
 pub type InfoHash = DhtNodeId;
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct DhtNode {
     pub id: Box<DhtNodeId>,
     pub addr: SocketAddr,
@@ -180,8 +193,8 @@ pub trait RouteTable {
     fn id(&self) -> &DhtNodeId;
     fn update(&mut self, node: DhtNode);
     fn nearests(&self, id: &DhtNodeId) -> Vec<&DhtNode>;
-    fn unheathy(&self) -> Box<dyn Iterator<Item = &DhtNode>>;
-    fn clean_unheathy(&mut self) -> Box<dyn Iterator<Item = &DhtNode>>;
+    fn unheathy(&self) -> Vec<&DhtNode>;
+    fn clean_unheathy(&mut self) -> Vec<&DhtNode>;
 }
 
 pub struct DhtClient<R: RouteTable> {
@@ -383,10 +396,7 @@ impl<R: RouteTable> DhtClient<R> {
                         target: &random_target,
                     },
                 };
-                if let Err(err) = socket
-                    .send_to(&krpc::to_bytes(query).unwrap(), addr)
-                    .await
-                {
+                if let Err(err) = socket.send_to(&krpc::to_bytes(query).unwrap(), addr).await {
                     warn!("Failed to send find_node: {}", err)
                 }
                 next_transaction_id += 1;

@@ -1,5 +1,9 @@
 pub mod kademila {
-    use std::{collections::LinkedList, fmt::Debug, time::SystemTime};
+    use std::{
+        collections::LinkedList,
+        fmt::Debug,
+        time::{Duration, SystemTime},
+    };
 
     use crate::dht::{DhtNode, DhtNodeId, RouteTable};
 
@@ -8,6 +12,7 @@ pub mod kademila {
         root: KBucket<K>,
         node_count: usize,
         bucket_count: usize,
+        unheathy: Vec<DhtNodeId>,
     }
 
     impl<const K: usize> KademilaRouter<K> {
@@ -17,6 +22,7 @@ pub mod kademila {
                 root: KBucket::new(),
                 node_count: 0,
                 bucket_count: 1,
+                unheathy: vec![],
             }
         }
 
@@ -47,12 +53,12 @@ pub mod kademila {
         ) {
             match bucket {
                 KBucket::Bucket { nodes, .. } => {
-                    let remaining = K - nodes.len();
+                    let remaining = K - result.len();
                     let take_k = nodes.iter().take(remaining);
                     result.extend(take_k);
                 }
                 KBucket::Branch { low, high } => {
-                    let (first, second) = if bit.next().expect("") {
+                    let (first, second) = if bit.next().unwrap() {
                         (high, low)
                     } else {
                         (low, high)
@@ -78,6 +84,7 @@ pub mod kademila {
                 root: KBucket::new(),
                 node_count: 0,
                 bucket_count: 1,
+                unheathy: vec![],
             }
         }
     }
@@ -148,12 +155,41 @@ pub mod kademila {
             nodes
         }
 
-        fn unheathy(&self) -> Box<dyn Iterator<Item = &DhtNode>> {
-            todo!()
+        fn unheathy(&self) -> Vec<&DhtNode> {
+            self.root
+                .into_iter()
+                .pure_buckets()
+                .filter_map(|b| match b {
+                    KBucket::Bucket {
+                        nodes,
+                        last_modified,
+                    } => todo!(),
+                    _ => None,
+                })
+                .collect()
         }
 
-        fn clean_unheathy(&mut self) -> Box<dyn Iterator<Item = &DhtNode>> {
-            todo!()
+        fn clean_unheathy(&mut self) -> Vec<&DhtNode> {
+            self.unheathy = self
+                .root
+                .into_iter()
+                .pure_buckets()
+                .filter_map(|b| match b {
+                    KBucket::Bucket {
+                        nodes,
+                        last_modified,
+                    } => {
+                        if SystemTime::now() > *last_modified + Duration::from_secs(60 * 15) {
+                            nodes.back()
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .cloned()
+                .collect();
+            self.unheathy
         }
     }
 
@@ -168,7 +204,6 @@ pub mod kademila {
             high: Box<KBucket<K>>,
         },
     }
-
     impl<const K: usize> KBucket<K> {
         pub fn new() -> Self {
             Self::Bucket {
@@ -202,12 +237,72 @@ pub mod kademila {
                 _ => (),
             }
         }
+
+        /// Returns `true` if the k_bucket is [`Bucket`].
+        pub fn is_bucket(&self) -> bool {
+            matches!(self, Self::Bucket { .. })
+        }
+
+        /// Returns `true` if the k_bucket is [`Branch`].
+        pub fn is_branch(&self) -> bool {
+            matches!(self, Self::Branch { .. })
+        }
+    }
+
+    impl<'a, const K: usize> IntoIterator for &'a KBucket<K> {
+        type Item = &'a KBucket<K>;
+
+        type IntoIter = KBucketBucketPreorderIter<'a, K>;
+
+        fn into_iter(self) -> Self::IntoIter {
+            KBucketBucketPreorderIter::new(self)
+        }
+    }
+
+    pub struct KBucketBucketPreorderIter<'a, const K: usize> {
+        stack: Vec<&'a KBucket<K>>,
+    }
+
+    impl<'a, const K: usize> KBucketBucketPreorderIter<'a, K> {
+        pub fn new(root: &'a KBucket<K>) -> Self {
+            Self { stack: vec![root] }
+        }
+
+        pub fn nodes(self) -> impl Iterator<Item = &'a DhtNode> {
+            self.pure_buckets()
+                .filter_map(|b| match b {
+                    KBucket::Bucket { nodes, .. } => Some(nodes),
+                    _ => None,
+                })
+                .flatten()
+        }
+        pub fn pure_buckets(self) -> impl Iterator<Item = &'a KBucket<K>> {
+            self.filter(|b| b.is_bucket())
+        }
+    }
+
+    impl<'a, const K: usize> Iterator for KBucketBucketPreorderIter<'a, K> {
+        type Item = &'a KBucket<K>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if let Some(bucket) = self.stack.pop() {
+                if let &KBucket::Branch { low, high } = &bucket {
+                    self.stack.push(&low);
+                    self.stack.push(&high);
+                }
+                Some(bucket)
+            } else {
+                None
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    use itertools::Itertools;
 
     use crate::dht::{DhtNode, DhtNodeId, RouteTable};
 
@@ -258,7 +353,7 @@ mod tests {
                 .1
         )
     }
-    
+
     #[test]
     fn kbucket_nearests() {
         let node = DhtNodeId::new(&{
@@ -276,20 +371,19 @@ mod tests {
         router.update(create_test_node(|bytes| bytes[0] = 0b10000));
         router.update(create_test_node(|bytes| bytes[0] = 0b10010));
 
+        let target = create_test_node(|bytes| bytes[0] = 0b10100).id().clone();
         let ids = router.inorder_dump();
+        let expected: Vec<_> = ids
+            .iter()
+            .sorted_by_key(|id| *id ^ &target)
+            .take(2)
+            .collect();
+        let result: Vec<_> = router
+            .nearests(&create_test_node(|bytes| bytes[0] = 0b10100).id())
+            .iter()
+            .map(|n| n.id())
+            .collect();
 
-        println!("{:#?}", router.root());
-
-        assert!(
-            ids.iter()
-                .fold((None, true), |(last, inc), id| {
-                    if let Some(last) = last {
-                        return (Some(id), inc && last <= id);
-                    } else {
-                        return (Some(id), inc);
-                    }
-                })
-                .1
-        )
+        assert_eq!(expected, result);
     }
 }
