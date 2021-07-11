@@ -1,11 +1,16 @@
+use log::LevelFilter;
 use seed_db_lib::{dht::DhtClient, route::kademila::KademilaRouter};
 use tokio::runtime::Builder;
 
 fn main() {
-    let rt = Builder::new_multi_thread().enable_io().build().unwrap();
+    pretty_env_logger::formatted_builder()
+        .filter_level(LevelFilter::Info)
+        .init();
+
+    let rt = Builder::new_multi_thread().enable_all().build().unwrap();
 
     rt.block_on(async {
-        let mut client: DhtClient<KademilaRouter<8>> = DhtClient::new().unwrap();
+        let mut client: DhtClient<KademilaRouter<8>> = DhtClient::new().await.unwrap();
         client
             .add_trackers(&[
                 "router.bittorrent.com:6881",

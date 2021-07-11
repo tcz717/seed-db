@@ -1,9 +1,12 @@
 pub mod kademila {
     use std::{
-        collections::LinkedList,
+        collections::HashSet,
         fmt::Debug,
         time::{Duration, SystemTime},
     };
+
+    use log::info;
+    use rand::prelude::IteratorRandom;
 
     use crate::dht::{DhtNode, DhtNodeId, RouteTable};
 
@@ -12,7 +15,7 @@ pub mod kademila {
         root: KBucket<K>,
         node_count: usize,
         bucket_count: usize,
-        unheathy: Vec<DhtNodeId>,
+        unheathy: HashSet<DhtNodeId>,
     }
 
     impl<const K: usize> KademilaRouter<K> {
@@ -22,7 +25,41 @@ pub mod kademila {
                 root: KBucket::new(),
                 node_count: 0,
                 bucket_count: 1,
-                unheathy: vec![],
+                unheathy: Default::default(),
+            }
+        }
+
+        pub fn find_node<'a>(&'a self, id: &DhtNodeId) -> Option<&'a DhtNode> {
+            let mut bit = id.traverse_bits().rev();
+            let mut bucket = &self.root;
+            loop {
+                match bucket {
+                    KBucket::Bucket { nodes, .. } => return nodes.iter().find(|n| n.id() == id),
+                    KBucket::Branch { low, high } => {
+                        bucket = if Some(true) == bit.next() { high } else { low };
+                    }
+                }
+            }
+        }
+
+        pub fn drop_node<'a>(&'a mut self, id: &DhtNodeId) {
+            let mut bit = id.traverse_bits().rev();
+            let mut bucket = &mut self.root;
+            loop {
+                match bucket {
+                    KBucket::Bucket { nodes, .. } => {
+                        if let Some(_) = nodes
+                            .iter()
+                            .position(|n| n.id() == id)
+                            .map(|n| nodes.remove(n))
+                        {
+                            self.node_count -= 1;
+                        }
+                    }
+                    KBucket::Branch { low, high } => {
+                        bucket = if Some(true) == bit.next() { high } else { low };
+                    }
+                }
             }
         }
 
@@ -84,7 +121,7 @@ pub mod kademila {
                 root: KBucket::new(),
                 node_count: 0,
                 bucket_count: 1,
-                unheathy: vec![],
+                unheathy: Default::default(),
             }
         }
     }
@@ -110,7 +147,12 @@ pub mod kademila {
                             }
                             None => {
                                 if nodes.len() < K {
-                                    nodes.push_front(node);
+                                    info!(
+                                        "New node found: {}, {} total",
+                                        node,
+                                        self.node_count + 1
+                                    );
+                                    nodes.push(node);
                                     self.node_count += 1;
                                     *last_modified = SystemTime::now();
                                     return;
@@ -156,21 +198,19 @@ pub mod kademila {
         }
 
         fn unheathy(&self) -> Vec<&DhtNode> {
-            self.root
-                .into_iter()
-                .pure_buckets()
-                .filter_map(|b| match b {
-                    KBucket::Bucket {
-                        nodes,
-                        last_modified,
-                    } => todo!(),
-                    _ => None,
-                })
+            self.unheathy
+                .iter()
+                .filter_map(|id| self.find_node(id))
                 .collect()
         }
 
         fn clean_unheathy(&mut self) -> Vec<&DhtNode> {
-            self.unheathy = self
+            let old_nodes = self.unheathy.drain().collect::<Vec<_>>();
+            info!("Cleaned {} nodes", old_nodes.len());
+            for node in old_nodes {
+                self.drop_node(&node);
+            }
+            let nodes: Vec<&DhtNode> = self
                 .root
                 .into_iter()
                 .pure_buckets()
@@ -180,23 +220,42 @@ pub mod kademila {
                         last_modified,
                     } => {
                         if SystemTime::now() > *last_modified + Duration::from_secs(60 * 15) {
-                            nodes.back()
+                            nodes.last()
                         } else {
                             None
                         }
                     }
                     _ => None,
                 })
-                .cloned()
                 .collect();
             self.unheathy
+                .extend(nodes.iter().map(|node| node.id().clone()));
+            nodes
+        }
+
+        fn nodes_count(&self) -> usize {
+            self.node_count
+        }
+
+        fn pick_node(&self) -> Option<&DhtNode> {
+            let mut bucket = &self.root;
+            loop {
+                match bucket {
+                    KBucket::Bucket { nodes, .. } => {
+                        return nodes.iter().choose(&mut rand::thread_rng())
+                    }
+                    KBucket::Branch { low, high } => {
+                        bucket = if rand::random() { high } else { low };
+                    }
+                }
+            }
         }
     }
 
     #[derive(Debug)]
     pub enum KBucket<const K: usize> {
         Bucket {
-            nodes: LinkedList<DhtNode>,
+            nodes: Vec<DhtNode>,
             last_modified: SystemTime,
         },
         Branch {

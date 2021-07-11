@@ -7,29 +7,33 @@ use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddr};
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
+pub struct KRpc<'a> {
+    #[serde(rename = "t")]
+    #[serde(with = "serde_bytes")]
+    pub transaction_id: &'a [u8],
+    #[serde(flatten)]
+    pub body: KRpcBody<'a>,
+    #[serde(rename = "v")]
+    #[serde(deserialize_with = "KRpc::deserialize_version")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub version: Option<&'a [u8]>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
 #[serde(tag = "y")]
-pub enum KRpc<'a> {
+pub enum KRpcBody<'a> {
     #[serde(rename = "q")]
-    Query {
-        #[serde(rename = "t")]
-        #[serde(with = "serde_bytes")]
-        transaction_id: &'a [u8],
-        #[serde(flatten)]
-        query: DhtQuery<'a>,
-    },
+    Query(DhtQuery<'a>),
     #[serde(rename = "r")]
     Response {
-        #[serde(rename = "t")]
-        #[serde(with = "serde_bytes")]
-        transaction_id: &'a [u8],
+        #[serde(borrow)]
         #[serde(rename = "r")]
         response: DhtResponse<'a>,
     },
     #[serde(rename = "e")]
     Error {
-        #[serde(rename = "t")]
-        #[serde(with = "serde_bytes")]
-        transaction_id: &'a [u8],
+        #[serde(borrow)]
         #[serde(rename = "e")]
         error: (i32, &'a str),
     },
@@ -37,20 +41,26 @@ pub enum KRpc<'a> {
 
 impl<'a> KRpc<'a> {
     pub fn node_id(&self) -> Option<&DhtNodeId> {
-        match self {
-            KRpc::Query { query, .. } => match query {
-                DhtQuery::AnnouncePeer { id, .. } => Some(*id),
-                DhtQuery::FindNode { id, .. } => Some(*id),
-                DhtQuery::GetPeers { id, .. } => Some(*id),
-                DhtQuery::Ping { id } => Some(*id),
+        match &self.body {
+            KRpcBody::Query(query) => match query {
+                DhtQuery::AnnouncePeer { id, .. } => Some(id),
+                DhtQuery::FindNode { id, .. } => Some(id),
+                DhtQuery::GetPeers { id, .. } => Some(id),
+                DhtQuery::Ping { id } => Some(id),
             },
-            KRpc::Response { response, .. } => match response {
-                DhtResponse::FindNode { id, .. } => Some(*id),
-                DhtResponse::GetPeers { id, .. } => Some(*id),
-                DhtResponse::PingOrAnnouncePeer { id } => Some(*id),
+            KRpcBody::Response { response, .. } => match response {
+                DhtResponse::FindNode { id, .. } => Some(id),
+                DhtResponse::GetPeers { id, .. } => Some(id),
+                DhtResponse::PingOrAnnouncePeer { id } => Some(id),
             },
-            KRpc::Error { .. } => None,
+            KRpcBody::Error { .. } => None,
         }
+    }
+    fn deserialize_version<'de: 'b, 'b, D>(deserializer: D) -> Result<Option<&'b [u8]>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_bytes(BytesSliceVisitor).map(Some)
     }
 }
 
@@ -260,21 +270,21 @@ pub fn to_bytes(query: KRpc) -> Result<Vec<u8>, bendy::serde::Error> {
     bendy::serde::to_bytes(&query)
 }
 
-pub fn from_bytes(buf: &[u8; 1024], len: usize) -> Result<KRpc<'_>, bendy::serde::Error> {
-    bendy::serde::from_bytes::<'_, KRpc<'_>>(&buf[..len])
+pub fn from_bytes(buf: &[u8]) -> Result<KRpc<'_>, bendy::serde::Error> {
+    bendy::serde::from_bytes::<'_, KRpc<'_>>(&buf)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::dht::krpc::{DhtQuery, DhtResponse, GetPeersResult, KRpc};
+    use crate::dht::krpc::{DhtQuery, DhtResponse, GetPeersResult, KRpc, KRpcBody};
 
     #[test]
     fn deserialize_ping_query() {
-        let query = KRpc::Query {
+        let id = b"abcdefghij0123456789".into();
+        let query = KRpc {
             transaction_id: b"aa",
-            query: DhtQuery::Ping {
-                id: &b"abcdefghij0123456789".into(),
-            },
+            body: KRpcBody::Query(DhtQuery::Ping { id: &id }),
+            version: None,
         };
         let bytes = bendy::serde::to_bytes(&query).unwrap();
 
@@ -286,15 +296,18 @@ mod tests {
 
     #[test]
     fn deserialize_announce_peer_query() {
-        let query = KRpc::Query {
+        let id = b"abcdefghij0123456789".into();
+        let info_hash = b"mnopqrstuvwxyz123456".into();
+        let query = KRpc {
             transaction_id: b"aa",
-            query: DhtQuery::AnnouncePeer {
-                id: &b"abcdefghij0123456789".into(),
+            body: KRpcBody::Query(DhtQuery::AnnouncePeer {
+                id: &id,
                 implied_port: Some(true),
-                info_hash: &b"mnopqrstuvwxyz123456".into(),
+                info_hash: &info_hash,
                 port: 6881,
                 token: "aoeusnth",
-            },
+            }),
+            version: None,
         };
         let bytes = bendy::serde::to_bytes(&query).unwrap();
 
@@ -306,16 +319,19 @@ mod tests {
 
     #[test]
     fn deserialize_get_peers_response() {
-        let query = KRpc::Response {
+        let query = KRpc {
             transaction_id: b"aa",
-            response: DhtResponse::GetPeers {
-                id: &b"abcdefghij0123456789".into(),
-                result: GetPeersResult::Found(vec![
-                    b"01234567890123456789".into(),
-                    b"a1234567890123456789".into(),
-                ]),
-                token: b"aoeusnth",
+            body: KRpcBody::Response {
+                response: DhtResponse::GetPeers {
+                    id: &b"abcdefghij0123456789".into(),
+                    result: GetPeersResult::Found(vec![
+                        b"01234567890123456789".into(),
+                        b"a1234567890123456789".into(),
+                    ]),
+                    token: b"aoeusnth",
+                },
             },
+            version: None,
         };
         let bytes = bendy::serde::to_bytes(&query).unwrap();
 
@@ -324,5 +340,24 @@ mod tests {
             bytes,
             "d1:rd2:id20:abcdefghij01234567895:token8:aoeusnth6:valuesl20:0123456789012345678920:a1234567890123456789ee1:t2:aa1:y1:re".as_bytes()
         );
+    }
+
+    #[test]
+    fn deserialize_get_peers_query() {
+        let hex=b"64313a6164323a696432303ac398079e33dca64ef0eebb016c2ddb4d5289c37e393a696e666f5f6861736832303ad9d695ca1cf8c0b265998e1cb23cf1d5b527c7b565313a71393a6765745f7065657273313a74323a5ff3313a76343a4c54012e313a79313a7165";
+
+        let bytes: Vec<_> = hex
+            .chunks_exact(2)
+            .map(|src| u8::from_str_radix(std::str::from_utf8(src).unwrap(), 16).unwrap())
+            .collect();
+
+        let packet = super::from_bytes(&bytes);
+        assert!(matches!(
+            packet.unwrap(),
+            super::KRpc {
+                body: KRpcBody::Query(super::DhtQuery::GetPeers { .. }),
+                ..
+            }
+        ));
     }
 }
