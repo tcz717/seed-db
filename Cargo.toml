@@ -11,6 +11,6 @@ edition = "2018"
 
 [dependencies]
 seed-db-lib = { path="seed-db-lib" }
-tokio = { version="1.*", features=["net", "rt", "rt-multi-thread"] }
+tokio = { version="1.*", features=["full"] }
 log = "0.*"
 pretty_env_logger = "0.*"

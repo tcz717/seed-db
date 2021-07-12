@@ -2,13 +2,15 @@ pub mod kademila {
     use std::{
         collections::HashSet,
         fmt::Debug,
+        sync::Arc,
         time::{Duration, SystemTime},
     };
 
     use log::info;
     use rand::prelude::IteratorRandom;
+    use Option;
 
-    use crate::dht::{DhtNode, DhtNodeId, RouteTable};
+    use crate::dht::{DhtNode, DhtNodeId, RouteTable, SharedDhtNode};
 
     pub struct KademilaRouter<const K: usize> {
         id: DhtNodeId,
@@ -29,7 +31,7 @@ pub mod kademila {
             }
         }
 
-        pub fn find_node<'a>(&'a self, id: &DhtNodeId) -> Option<&'a DhtNode> {
+        pub fn find_node<'a>(&'a self, id: &DhtNodeId) -> Option<&SharedDhtNode> {
             let mut bit = id.traverse_bits().rev();
             let mut bucket = &self.root;
             loop {
@@ -74,7 +76,7 @@ pub mod kademila {
         fn dfs(bucket: &KBucket<K>, ids: &mut Vec<DhtNodeId>) {
             match bucket {
                 KBucket::Bucket { nodes, .. } => {
-                    ids.extend(nodes.iter().map(|n| n.id.as_ref().clone()));
+                    ids.extend(nodes.iter().map(|n| n.id.clone()));
                 }
                 KBucket::Branch { low, high } => {
                     Self::dfs(low.as_ref(), ids);
@@ -86,7 +88,7 @@ pub mod kademila {
         fn nearests_core<'a>(
             bucket: &'a KBucket<K>,
             bit: &mut impl Iterator<Item = bool>,
-            result: &mut Vec<&'a DhtNode>,
+            result: &mut Vec<&'a SharedDhtNode>,
         ) {
             match bucket {
                 KBucket::Bucket { nodes, .. } => {
@@ -141,7 +143,7 @@ pub mod kademila {
                     } => {
                         match nodes.iter_mut().find(|n| n.id == node.id) {
                             Some(n) => {
-                                *n = node;
+                                *n = Arc::new(node);
                                 *last_modified = SystemTime::now();
                                 return;
                             }
@@ -152,7 +154,7 @@ pub mod kademila {
                                         node,
                                         self.node_count + 1
                                     );
-                                    nodes.push(node);
+                                    nodes.push(Arc::new(node));
                                     self.node_count += 1;
                                     *last_modified = SystemTime::now();
                                     return;
@@ -184,7 +186,7 @@ pub mod kademila {
             &self.id
         }
 
-        fn nearests(&self, id: &DhtNodeId) -> Vec<&DhtNode> {
+        fn nearests(&self, id: &DhtNodeId) -> Vec<&SharedDhtNode> {
             let mut nodes = Vec::with_capacity(K);
             Self::nearests_core(
                 &self.root,
@@ -197,20 +199,21 @@ pub mod kademila {
             nodes
         }
 
-        fn unheathy(&self) -> Vec<&DhtNode> {
+        fn unheathy(&self) -> Vec<SharedDhtNode> {
             self.unheathy
                 .iter()
                 .filter_map(|id| self.find_node(id))
+                .cloned()
                 .collect()
         }
 
-        fn clean_unheathy(&mut self) -> Vec<&DhtNode> {
+        fn clean_unheathy(&mut self) -> Vec<SharedDhtNode> {
             let old_nodes = self.unheathy.drain().collect::<Vec<_>>();
             info!("Cleaned {} nodes", old_nodes.len());
             for node in old_nodes {
                 self.drop_node(&node);
             }
-            let nodes: Vec<&DhtNode> = self
+            let nodes: Vec<SharedDhtNode> = self
                 .root
                 .into_iter()
                 .pure_buckets()
@@ -227,6 +230,7 @@ pub mod kademila {
                     }
                     _ => None,
                 })
+                .cloned()
                 .collect();
             self.unheathy
                 .extend(nodes.iter().map(|node| node.id().clone()));
@@ -237,7 +241,7 @@ pub mod kademila {
             self.node_count
         }
 
-        fn pick_node(&self) -> Option<&DhtNode> {
+        fn pick_node(&self) -> Option<&SharedDhtNode> {
             let mut bucket = &self.root;
             loop {
                 match bucket {
@@ -255,7 +259,7 @@ pub mod kademila {
     #[derive(Debug)]
     pub enum KBucket<const K: usize> {
         Bucket {
-            nodes: Vec<DhtNode>,
+            nodes: Vec<SharedDhtNode>,
             last_modified: SystemTime,
         },
         Branch {
@@ -281,7 +285,7 @@ pub mod kademila {
                     let (low, high) = nodes
                         .split_off(0)
                         .into_iter()
-                        .partition(|node| node.id.as_ref() < split_point);
+                        .partition(|node| node.id.as_ref() < split_point.as_ref());
                     *self = KBucket::Branch {
                         low: Box::new(KBucket::Bucket {
                             nodes: low,
@@ -327,7 +331,7 @@ pub mod kademila {
             Self { stack: vec![root] }
         }
 
-        pub fn nodes(self) -> impl Iterator<Item = &'a DhtNode> {
+        pub fn nodes(self) -> impl Iterator<Item = &'a SharedDhtNode> {
             self.pure_buckets()
                 .filter_map(|b| match b {
                     KBucket::Bucket { nodes, .. } => Some(nodes),

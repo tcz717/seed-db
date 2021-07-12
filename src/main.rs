@@ -1,6 +1,6 @@
 use log::LevelFilter;
 use seed_db_lib::{dht::DhtClient, route::kademila::KademilaRouter};
-use tokio::runtime::Builder;
+use tokio::{runtime::Builder, signal::ctrl_c};
 
 fn main() {
     pretty_env_logger::formatted_builder()
@@ -20,7 +20,8 @@ fn main() {
                 "dht.aelitis.com:6881",
             ])
             .await;
-        client.run().await
+        let _ = client.run();
+        ctrl_c().await
     })
     .unwrap();
 }

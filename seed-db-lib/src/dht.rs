@@ -4,9 +4,10 @@ use serde::de::Visitor;
 use serde::{Deserialize, Serialize, Serializer};
 use tokio::net::UdpSocket;
 use tokio::net::{lookup_host, ToSocketAddrs};
-use tokio::spawn;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
+use tokio::{join, spawn};
 
 use std::convert::TryInto;
 use std::fmt::{Debug, Display};
@@ -218,21 +219,18 @@ pub type InfoHash = DhtNodeId;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct DhtNode {
-    pub id: Box<DhtNodeId>,
+    pub id: DhtNodeId,
     pub addr: SocketAddr,
 }
 
 impl DhtNode {
     pub fn new(id: DhtNodeId, addr: SocketAddr) -> Self {
-        Self {
-            id: Box::new(id),
-            addr,
-        }
+        Self { id: id, addr }
     }
 
     /// Get a reference to the dht node's id.
     pub fn id(&self) -> &DhtNodeId {
-        self.id.as_ref()
+        &self.id
     }
 }
 
@@ -242,14 +240,16 @@ impl Display for DhtNode {
     }
 }
 
+pub type SharedDhtNode = Arc<DhtNode>;
+
 pub trait RouteTable {
     fn id(&self) -> &DhtNodeId;
     fn update(&mut self, node: DhtNode);
     fn nodes_count(&self) -> usize;
-    fn nearests(&self, id: &DhtNodeId) -> Vec<&DhtNode>;
-    fn unheathy(&self) -> Vec<&DhtNode>;
-    fn clean_unheathy(&mut self) -> Vec<&DhtNode>;
-    fn pick_node(&self) -> Option<&DhtNode>;
+    fn nearests(&self, id: &DhtNodeId) -> Vec<&SharedDhtNode>;
+    fn unheathy(&self) -> Vec<SharedDhtNode>;
+    fn clean_unheathy(&mut self) -> Vec<SharedDhtNode>;
+    fn pick_node(&self) -> Option<&SharedDhtNode>;
 }
 
 pub struct DhtClient<R: RouteTable> {
@@ -260,6 +260,24 @@ pub struct DhtClient<R: RouteTable> {
     id: DhtNodeId,
     /// To be removed in the future
     seeds: std::collections::HashSet<InfoHash>,
+}
+
+pub struct DhtClientController {
+    main: JoinHandle<()>,
+    route_maintaining: JoinHandle<()>,
+    find_node_sender: JoinHandle<()>,
+    crawler: JoinHandle<()>,
+}
+
+impl DhtClientController {
+    pub async fn stop(self) {
+        let _ = join!(
+            self.main,
+            self.route_maintaining,
+            self.find_node_sender,
+            self.crawler
+        );
+    }
 }
 
 impl<R: RouteTable + Default> DhtClient<R> {
@@ -298,37 +316,45 @@ where
         self.trackers.len() - old_size
     }
 
-    pub async fn run(&mut self) -> Result<(), std::io::Error> {
-        let mut buf = vec![0_u8; 4 * 1024];
+    pub fn run(mut self) -> DhtClientController {
         let (find_node, rx) = mpsc::channel::<SocketAddr>(128);
-        Self::start_route_maintaining_thread(
+        let route_maintaining = Self::start_route_maintaining_thread(
             self.router.clone(),
             self.trackers.clone(),
             find_node.clone(),
         );
-        Self::start_find_node_thread(self.id.clone(), self.udp.clone(), rx);
-        Self::start_crawler_thread(self.router.clone(), find_node.clone());
+        let find_node_sender = Self::start_find_node_thread(self.id.clone(), self.udp.clone(), rx);
+        let crawler = Self::start_crawler_thread(self.router.clone(), find_node.clone());
 
-        loop {
-            match self.udp.recv_from(&mut *buf).await {
-                Ok((len, addr)) => {
-                    debug!("{:?} bytes received from {:?}", len, addr);
+        let main = spawn(async move {
+            let mut buf = vec![0_u8; 4 * 1024];
+            loop {
+                match self.udp.recv_from(&mut *buf).await {
+                    Ok((len, addr)) => {
+                        debug!("{:?} bytes received from {:?}", len, addr);
 
-                    if let Ok(packet) = krpc::from_bytes(&buf[0..len]) {
-                        // println!("{:#?} packet received", packet);
-                        if let Some(id) = packet.node_id() {
-                            let node = DhtNode::new(id.clone(), addr.clone());
-                            trace!("Updating Node {}", &node);
-                            self.router.write().await.update(node);
+                        if let Ok(packet) = krpc::from_bytes(&buf[0..len]) {
+                            // println!("{:#?} packet received", packet);
+                            if let Some(id) = packet.node_id() {
+                                let node = DhtNode::new(id.clone(), addr.clone());
+                                trace!("Updating Node {}", &node);
+                                self.router.write().await.update(node);
+                            }
+                            self.process_packet(packet, addr, &find_node).await;
+                        } else {
+                            warn!("Unknown packet received from {:?}", addr);
                         }
-                        self.process_packet(packet, addr, &find_node).await;
-                    } else {
-                        warn!("Unknown packet received from {:?}", addr);
                     }
+                    Err(err) => error!("Failed to read packet {}", err),
                 }
-                Err(err) => error!("Failed to read packet {}", err),
             }
-        }
+        });
+        return DhtClientController {
+            main,
+            route_maintaining,
+            find_node_sender,
+            crawler,
+        };
     }
 
     async fn process_packet(
@@ -345,7 +371,12 @@ where
             } => {
                 if let Err(err) = match query {
                     DhtQuery::AnnouncePeer { info_hash, .. } => {
-                        info!("Got seed hash: {}", info_hash);
+                        self.seeds.insert(info_hash.clone());
+                        info!(
+                            "Got seed hash: {} ({} in total)",
+                            info_hash,
+                            self.seeds.len()
+                        );
                         self.reply_ping(transaction_id, &addr).await
                     }
                     DhtQuery::FindNode { target, .. } => {
@@ -434,8 +465,14 @@ where
         addr: &SocketAddr,
     ) -> Result<(), std::io::Error> {
         debug!("Replying find_node to {}", addr);
-        let nearests =
-            DhtNodeCompactListOwned::from(self.router.read().await.nearests(target).into_iter());
+        let nearests = DhtNodeCompactListOwned::from(
+            self.router
+                .read()
+                .await
+                .nearests(target)
+                .into_iter()
+                .map(Arc::as_ref),
+        );
         let response = KRpc {
             transaction_id,
             body: KRpcBody::Response {
@@ -459,8 +496,14 @@ where
         addr: &SocketAddr,
     ) -> Result<(), std::io::Error> {
         debug!("Replying find_node to {}", addr);
-        let nearests =
-            DhtNodeCompactListOwned::from(self.router.read().await.nearests(info_hash).into_iter());
+        let nearests = DhtNodeCompactListOwned::from(
+            self.router
+                .read()
+                .await
+                .nearests(info_hash)
+                .into_iter()
+                .map(Arc::as_ref),
+        );
         let response = KRpc {
             transaction_id,
             body: KRpcBody::Response {
@@ -482,7 +525,7 @@ where
         myid: DhtNodeId,
         socket: Arc<UdpSocket>,
         mut rt: mpsc::Receiver<SocketAddr>,
-    ) {
+    ) -> JoinHandle<()> {
         spawn(async move {
             let mut next_transaction_id: u16 = 0;
             while let Some(addr) = rt.recv().await {
@@ -501,35 +544,33 @@ where
                 }
                 next_transaction_id = next_transaction_id.overflowing_add(1).0;
             }
-        });
+        })
     }
 
     fn start_route_maintaining_thread(
         route: Arc<RwLock<R>>,
         trackers: Vec<SocketAddr>,
         tx: mpsc::Sender<SocketAddr>,
-    ) {
+    ) -> JoinHandle<()> {
         spawn(async move {
             let route_lock = route;
+            let mut bootstraped = false;
             loop {
-                if route_lock.read().await.nodes_count() < 5 {
+                if !bootstraped && route_lock.read().await.nodes_count() < 5 {
                     for tracker in trackers.clone().iter() {
                         if let Err(err) = tx.send(tracker.clone()).await {
                             error!("Failed to send find_node, small route table: {}", err)
                         }
                     }
                 } else {
+                    bootstraped = true;
                     let unheathy: Vec<_> = {
                         let mut route = route_lock.write().await;
-                        route
-                            .clean_unheathy()
-                            .iter()
-                            .map(|node| node.addr)
-                            .collect()
+                        route.clean_unheathy()
                     };
                     info!("Found {} unheathy nodes", unheathy.len());
-                    for addr in unheathy {
-                        if let Err(err) = tx.send(addr.clone()).await {
+                    for node in unheathy {
+                        if let Err(err) = tx.send(node.addr.clone()).await {
                             error!(
                                 "Failed to send find_node, update unhealth route table: {}",
                                 err
@@ -540,10 +581,10 @@ where
 
                 sleep(Duration::from_secs(10)).await
             }
-        });
+        })
     }
 
-    fn start_crawler_thread(route: Arc<RwLock<R>>, tx: mpsc::Sender<SocketAddr>) {
+    fn start_crawler_thread(route: Arc<RwLock<R>>, tx: mpsc::Sender<SocketAddr>) -> JoinHandle<()> {
         spawn(async move {
             let route_lock = route;
             loop {
@@ -554,7 +595,7 @@ where
 
                 sleep(Duration::from_millis(200)).await
             }
-        });
+        })
     }
 }
 

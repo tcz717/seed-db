@@ -211,7 +211,7 @@ impl DhtNodeCompact {
 impl Into<DhtNode> for &DhtNodeCompact {
     fn into(self) -> DhtNode {
         DhtNode {
-            id: Box::new(DhtNodeId::new(self.0[0..20].try_into().unwrap())),
+            id: DhtNodeId::new(self.0[0..20].try_into().unwrap()),
             addr: SocketAddr::from((
                 Ipv4Addr::from(<&[u8; 4]>::try_from(&self.0[20..24]).unwrap().to_owned()),
                 u16::from_be_bytes(self.0[24..26].try_into().unwrap()),
