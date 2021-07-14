@@ -345,7 +345,12 @@ where
                             warn!("Unknown packet received from {:?}", addr);
                         }
                     }
-                    Err(err) => error!("Failed to read packet {}", err),
+                    Err(err) => {
+                        // Ignore UDP `WSAECONNRESET`
+                        if err.raw_os_error() != Some(10054) {
+                            error!("Failed to read packet {}", err)
+                        }
+                    }
                 }
             }
         });
