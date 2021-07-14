@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio::{join, spawn};
 
+use std::borrow::Borrow;
 use std::convert::TryInto;
 use std::fmt::{Debug, Display};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -92,7 +93,11 @@ impl std::ops::BitXor for &DhtNodeId {
 impl Debug for DhtNodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for i in self.0 {
-            write!(f, "{:02X} ", i)?
+            if f.alternate() {
+                write!(f, "{:02X} ", i)?
+            } else {
+                write!(f, "{:02X}", i)?
+            }
         }
         Ok(())
     }
@@ -106,6 +111,12 @@ impl Display for DhtNodeId {
 
 impl AsRef<[u8; 20]> for DhtNodeId {
     fn as_ref(&self) -> &[u8; 20] {
+        &self.0
+    }
+}
+
+impl Borrow<[u8; 20]> for DhtNodeId {
+    fn borrow(&self) -> &[u8; 20] {
         &self.0
     }
 }

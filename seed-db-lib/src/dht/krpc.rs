@@ -111,7 +111,7 @@ pub enum DhtResponse<'a> {
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum GetPeersResult<'a> {
     #[serde(rename = "values")]
-    Found(Vec<DhtNodeId>),
+    Found(Vec<&'a DhtPeerCompact>),
     #[serde(rename = "nodes")]
     #[serde(borrow)]
     NotFound(DhtNodeCompactList<'a>),
@@ -143,7 +143,14 @@ where
         let len = nodes.size_hint().0 * size_of::<DhtNodeCompact>();
         let mut data = Vec::with_capacity(len);
         for node in nodes {
-            data.extend_from_slice(node.id().as_ref())
+            data.extend_from_slice(node.id().as_ref());
+            match node.addr {
+                SocketAddr::V4(socketv4) => {
+                    data.extend_from_slice(&socketv4.ip().octets());
+                    data.extend_from_slice(&socketv4.port().to_be_bytes());
+                }
+                SocketAddr::V6(_) => panic!("Ip V4 cant be stored to DhtNodeCompactListOwned"),
+            }
         }
         Self(data)
     }
@@ -266,6 +273,90 @@ impl<'de: 'a, 'a> Deserialize<'de> for &'a DhtNodeCompact {
     }
 }
 
+#[repr(transparent)]
+#[derive(PartialEq, Eq, Hash)]
+pub struct DhtPeerCompact([u8; 6]);
+
+impl DhtPeerCompact {
+    pub fn addr(&self) -> SocketAddr {
+        SocketAddr::from((
+            Ipv4Addr::from(<&[u8; 4]>::try_from(&self.0[0..4]).unwrap().to_owned()),
+            u16::from_be_bytes(self.0[4..6].try_into().unwrap()),
+        ))
+    }
+}
+
+impl From<&DhtPeerCompact> for SocketAddr {
+    fn from(val: &DhtPeerCompact) -> Self {
+        val.addr()
+    }
+}
+
+impl From<&[u8; 6]> for DhtPeerCompact {
+    fn from(val: &[u8; 6]) -> Self {
+        Self(val.clone())
+    }
+}
+
+impl From<&SocketAddr> for DhtPeerCompact {
+    fn from(val: &SocketAddr) -> Self {
+        match val {
+            SocketAddr::V4(socketv4) => {
+                let mut bytes = [0u8; 6];
+                bytes[0..4].copy_from_slice(&socketv4.ip().octets());
+                bytes[4..6].copy_from_slice(&socketv4.port().to_be_bytes());
+                Self(bytes)
+            }
+            SocketAddr::V6(_) => panic!("Ip V4 cant be stored to DhtPeerCompact"),
+        }
+    }
+}
+
+impl Debug for DhtPeerCompact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DhtPeerCompact")
+            .field(
+                "addr",
+                &SocketAddr::from((
+                    Ipv4Addr::from(<&[u8; 4]>::try_from(&self.0[0..4]).unwrap().to_owned()),
+                    u16::from_be_bytes(self.0[4..6].try_into().unwrap()),
+                )),
+            )
+            .finish()
+    }
+}
+
+impl Serialize for DhtPeerCompact {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DhtPeerCompact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_bytes(BytesVisitor::<6>)
+            .map(DhtPeerCompact)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for &'a DhtPeerCompact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_bytes(BytesVisitor::<6>)
+            .map(|bytes| unsafe { &*(bytes.as_ptr() as *const _) })
+    }
+}
+
 use bendy::serde as bencode;
 pub fn to_bytes(query: KRpc) -> Result<Vec<u8>, bencode::Error> {
     bencode::to_bytes(&query)
@@ -277,7 +368,12 @@ pub fn from_bytes(buf: &[u8]) -> Result<KRpc<'_>, bencode::Error> {
 
 #[cfg(test)]
 mod tests {
-    use crate::dht::krpc::{DhtQuery, DhtResponse, GetPeersResult, KRpc, KRpcBody};
+    use std::net::Ipv4Addr;
+
+    use crate::dht::{
+        krpc::{DhtNodeCompactListOwned, DhtQuery, DhtResponse, GetPeersResult, KRpc, KRpcBody},
+        DhtNode,
+    };
 
     #[test]
     fn deserialize_ping_query() {
@@ -319,16 +415,15 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_get_peers_response() {
+    fn deserialize_get_peers_response_found() {
+        let p1 = b"012345".into();
+        let p2 = b"a12345".into();
         let query = KRpc {
             transaction_id: b"aa",
             body: KRpcBody::Response {
                 response: DhtResponse::GetPeers {
                     id: &b"abcdefghij0123456789".into(),
-                    result: GetPeersResult::Found(vec![
-                        b"01234567890123456789".into(),
-                        b"a1234567890123456789".into(),
-                    ]),
+                    result: GetPeersResult::Found(vec![&p1, &p2]),
                     token: b"aoeusnth",
                 },
             },
@@ -339,7 +434,50 @@ mod tests {
         println!("{}", std::str::from_utf8(&bytes).unwrap());
         assert_eq!(
             bytes,
-            "d1:rd2:id20:abcdefghij01234567895:token8:aoeusnth6:valuesl20:0123456789012345678920:a1234567890123456789ee1:t2:aa1:y1:re".as_bytes()
+            "d1:rd2:id20:abcdefghij01234567895:token8:aoeusnth6:valuesl6:0123456:a12345ee1:t2:aa1:y1:re".as_bytes()
+        );
+    }
+
+    #[test]
+    fn deserialize_get_peers_response_not_found() {
+        let node_list: DhtNodeCompactListOwned = vec![
+            DhtNode::new(
+                b"abcdefghij0123456789".into(),
+                (
+                    Ipv4Addr::new(b'1', b'1', b'1', b'1'),
+                    u16::from_be_bytes(*b"ab"),
+                )
+                    .into(),
+            ),
+            DhtNode::new(
+                b"xbcdefghij0123456789".into(),
+                (
+                    Ipv4Addr::new(b'2', b'2', b'2', b'2'),
+                    u16::from_be_bytes(*b"cd"),
+                )
+                    .into(),
+            ),
+        ]
+        .iter()
+        .into();
+        let query = KRpc {
+            transaction_id: b"aa",
+            body: KRpcBody::Response {
+                response: DhtResponse::GetPeers {
+                    id: &b"abcdefghij0123456789".into(),
+                    result: GetPeersResult::NotFound((&node_list).into()),
+                    token: b"aoeusnth",
+                },
+            },
+            version: None,
+        };
+        let bytes = super::to_bytes(query).unwrap();
+
+        println!("{}", std::str::from_utf8(&bytes).unwrap());
+        assert_eq!(
+            bytes,
+            "d1:rd2:id20:abcdefghij01234567895:nodes52:abcdefghij01234567891111abxbcdefghij01234567892222cd5:token8:aoeusnthe1:t2:aa1:y1:re"
+                .as_bytes()
         );
     }
 
