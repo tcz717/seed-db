@@ -6,7 +6,7 @@ use std::fmt::Debug;
 use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddr};
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct KRpc<'a> {
     #[serde(rename = "t")]
     #[serde(with = "serde_bytes")]
@@ -20,7 +20,7 @@ pub struct KRpc<'a> {
     pub version: Option<&'a [u8]>,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 #[serde(tag = "y")]
 pub enum KRpcBody<'a> {
     #[serde(rename = "q")]
@@ -64,7 +64,7 @@ impl<'a> KRpc<'a> {
     }
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "q", content = "a")]
 pub enum DhtQuery<'a> {
@@ -90,7 +90,7 @@ pub enum DhtQuery<'a> {
         id: &'a DhtNodeId,
     },
 }
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 #[serde(untagged)]
 pub enum DhtResponse<'a> {
     FindNode {
@@ -108,7 +108,7 @@ pub enum DhtResponse<'a> {
         id: &'a DhtNodeId,
     },
 }
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub enum GetPeersResult<'a> {
     #[serde(rename = "values")]
     Found(Vec<&'a DhtPeerCompact>),
@@ -129,7 +129,7 @@ impl<'a> DhtQuery<'a> {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub struct DhtNodeCompactList<'a>(&'a [u8]);
 
 #[derive(PartialEq)]

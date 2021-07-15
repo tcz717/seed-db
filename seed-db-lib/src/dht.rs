@@ -338,7 +338,7 @@ where
         let crawler = Self::start_crawler_thread(self.router.clone(), find_node.clone());
 
         let main = spawn(async move {
-            let mut buf = vec![0_u8; 4 * 1024];
+            let mut buf = vec![0_u8; u16::MAX as usize];
             loop {
                 match self.udp.recv_from(&mut *buf).await {
                     Ok((len, addr)) => {
