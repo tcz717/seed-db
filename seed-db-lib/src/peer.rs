@@ -1,18 +1,26 @@
-use std::{fmt::Display, io, net::SocketAddr};
+use std::{collections::HashMap, fmt::Display, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use bitflags::bitflags;
-use bytes::{BufMut, BytesMut};
-use futures::SinkExt;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt, TryStreamExt,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    spawn,
+    sync::{Mutex, Notify},
+    time::timeout,
 };
 use tokio_util::codec::{length_delimited, Framed, LengthDelimitedCodec};
 
 use crate::dht::{DhtNodeId, InfoHash};
 
 pub type PeerId = DhtNodeId;
+
+pub mod metadata;
 
 #[derive(Debug)]
 pub enum PeerProtocalError {
@@ -32,6 +40,9 @@ impl Display for PeerProtocalError {
 }
 
 const BIT_TORRENT_PROTOCOL: &[u8; 19] = b"BitTorrent protocol";
+
+const LT_EXTENSION_MSG_ID: u8 = 20;
+const HANDSHAKE_EXTENDED_MSG_ID: u8 = 0;
 
 bitflags! {
     /// ```txt
@@ -73,21 +84,50 @@ bitflags! {
 pub struct ExtensionHandshake {
     #[serde(rename = "m")]
     messages: ExtensionMessages,
+    matadata_size: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ExtensionMessages {
-    #[serde(default)]
-    #[serde(rename = "ut_metadata")]
-    metadata: u8,
+pub type ExtensionMessages = HashMap<String, u8>;
+
+#[derive(Debug)]
+pub struct PeerConnectionState {
+    local_interest: bool,
+    local_chock: bool,
+    remote_interest: bool,
+    remote_chock: bool,
+    local_extension: ExtensionMessages,
+    remote_extension: Option<ExtensionMessages>,
+    handlers: Vec<Box<dyn ExtensionPlugin>>,
+}
+
+impl Default for PeerConnectionState {
+    fn default() -> Self {
+        Self {
+            local_interest: false,
+            local_chock: true,
+            remote_interest: false,
+            remote_chock: true,
+            local_extension: Default::default(),
+            remote_extension: Default::default(),
+            handlers: Default::default(),
+        }
+    }
+}
+
+pub trait ExtensionPlugin: std::fmt::Debug + Send {
+    fn resister(&mut self, _connection: &mut PeerConnection) {}
+    fn process(&mut self, msg: &mut Bytes);
+    fn msg_name(&self) -> &'static str;
 }
 
 pub struct PeerConnection {
-    stream: Framed<TcpStream, LengthDelimitedCodec>,
+    sink: SplitSink<Framed<TcpStream, LengthDelimitedCodec>, bytes::Bytes>,
     info_hash: Box<InfoHash>,
     local_peer_id: Box<PeerId>,
     remote_peer_id: Box<PeerId>,
     reserved_bits: PeerReservedBit,
+    state: Arc<Mutex<PeerConnectionState>>,
+    state_changed: Arc<Notify>,
 }
 
 impl PeerConnection {
@@ -141,28 +181,128 @@ impl PeerConnection {
         stream.read_exact(&mut remote_peer_id).await?;
         let remote_peer_id = PeerId::new(&remote_peer_id);
 
+        let (sink, stream) = length_delimited::Builder::new()
+            .length_field_length(4)
+            .big_endian()
+            .new_framed(stream)
+            .split();
+        let state: Arc<Mutex<PeerConnectionState>> = Default::default();
+        let state_changed: Arc<Notify> = Default::default();
+        Self::start_listen_thread(stream, state.clone(), state_changed.clone());
+
         Ok(Self {
-            stream: length_delimited::Builder::new()
-                .length_field_length(4)
-                .big_endian()
-                .new_framed(stream),
+            sink,
             info_hash: Box::new(info_hash.clone()),
             local_peer_id: Box::new(local_peer_id.clone()),
             remote_peer_id: Box::new(remote_peer_id.clone()),
             reserved_bits: PeerReservedBit::from_bits_truncate(u64::from_be_bytes(reserved_bytes))
                 & reserved,
+            state,
+            state_changed,
         })
     }
 
-    pub async fn extension_handshake(&mut self) -> Result<(), io::Error> {
+    fn start_listen_thread(
+        mut stream: SplitStream<Framed<TcpStream, LengthDelimitedCodec>>,
+        state: Arc<Mutex<PeerConnectionState>>,
+        state_changed: Arc<Notify>,
+    ) {
+        spawn(async move {
+            while let Some(mut data) = stream.try_next().await.ok().flatten() {
+                let msg_id = data.get_u8();
+                match msg_id {
+                    LT_EXTENSION_MSG_ID => {
+                        Self::handle_extension_msg(data.freeze(), &state, &state_changed).await;
+                    }
+                    _ => (),
+                }
+            }
+        });
+    }
+
+    async fn handle_extension_msg(
+        mut data: Bytes,
+        state: &Arc<Mutex<PeerConnectionState>>,
+        state_changed: &Arc<Notify>,
+    ) {
+        let extended_id = data.get_u8();
+        if extended_id == HANDSHAKE_EXTENDED_MSG_ID {
+            let handshake: ExtensionHandshake = bendy::serde::from_bytes(&data).unwrap();
+
+            let mut state = state.lock().await;
+
+            state.remote_extension = Some(handshake.messages);
+            state_changed.notify_one();
+        } else {
+            let mut state = state.lock().await;
+            let handler = state
+                .local_extension
+                .iter()
+                .find(|(_, ext_id)| **ext_id == extended_id)
+                .map(|p| p.0.to_owned())
+                .and_then(|msg_name| {
+                    state
+                        .handlers
+                        .iter_mut()
+                        .find(|ext| ext.msg_name() == msg_name)
+                });
+            if let Some(handler) = handler {
+                handler.process(&mut data);
+            }
+        }
+    }
+
+    pub async fn extension_handshake(&mut self) -> Result<bool, io::Error> {
+        if !self
+            .reserved_bits
+            .contains(PeerReservedBit::LIBTORRENT_EXTENSION_PROTOCOL)
+        {
+            return Ok(false);
+        }
+
         let mut buf = BytesMut::with_capacity(32);
-        buf.put_u8(20);
+        buf.put_u8(LT_EXTENSION_MSG_ID);
+        buf.put_u8(HANDSHAKE_EXTENDED_MSG_ID);
         let handshake = ExtensionHandshake {
-            messages: ExtensionMessages { metadata: 1 },
+            messages: self
+                .state
+                .lock()
+                .await
+                .handlers
+                .iter()
+                .enumerate()
+                .map(|(id, handler)| (handler.msg_name().to_owned(), id as u8))
+                .collect(),
+            matadata_size: None,
         };
 
         buf.put(bendy::serde::to_bytes(&handshake).unwrap().as_ref());
-        self.stream.send(buf.freeze()).await?;
-        Ok(())
+        self.sink.send(buf.freeze()).await?;
+        self.state.lock().await.local_extension = handshake.messages;
+
+        for _ in 0..5 {
+            if let Ok(_) = timeout(Duration::from_secs(1), self.state_changed.notified()).await {
+                if self.state.lock().await.remote_extension.is_some() {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Get a reference to the peer connection's remote peer id.
+    pub fn remote_peer_id(&self) -> &PeerId {
+        self.remote_peer_id.as_ref()
+    }
+
+    /// Get a reference to the peer connection's local peer id.
+    pub fn local_peer_id(&self) -> &PeerId {
+        self.local_peer_id.as_ref()
+    }
+
+    /// Get a reference to the peer connection's info hash.
+    pub fn info_hash(&self) -> &InfoHash {
+        self.info_hash.as_ref()
     }
 }

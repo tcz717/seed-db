@@ -10,11 +10,12 @@ use tokio::time::sleep;
 use tokio::{join, spawn};
 
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::convert::TryInto;
 use std::fmt::{Debug, Display};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::dht::krpc::{
     DhtNodeCompactListOwned, DhtQuery, DhtResponse, GetPeersResult, KRpc, KRpcBody,
@@ -543,8 +544,20 @@ where
         mut rt: mpsc::Receiver<SocketAddr>,
     ) -> JoinHandle<()> {
         spawn(async move {
+            let mut dedup_set: HashSet<SocketAddr> = HashSet::new();
+            let mut last_clean: SystemTime = SystemTime::now();
             let mut next_transaction_id: u16 = 0;
             while let Some(addr) = rt.recv().await {
+                if last_clean + Duration::from_secs(5) < SystemTime::now() {
+                    dedup_set.clear();
+                    last_clean = SystemTime::now();
+                }
+                if dedup_set.contains(&addr) {
+                    debug!("Deduped find_node to {}", addr);
+                    continue;
+                }
+                dedup_set.insert(addr.clone());
+
                 debug!("Sending find_node to {}", addr);
                 let random_target = DhtNodeId::random();
                 let query = KRpc {
