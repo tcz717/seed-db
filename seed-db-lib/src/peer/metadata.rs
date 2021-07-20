@@ -1,4 +1,11 @@
+use std::{
+    fmt::Display,
+    io::{self, ErrorKind},
+};
+
+use bitvec::prelude::*;
 use bytes::Bytes;
+use log::warn;
 use serde::{
     de::{Error, Unexpected, Visitor},
     ser::SerializeMap,
@@ -6,6 +13,8 @@ use serde::{
 };
 
 use super::ExtensionPlugin;
+
+const KB: u64 = 1024;
 
 #[derive(Debug)]
 pub enum MetadataMessage {
@@ -17,6 +26,10 @@ pub enum MetadataMessage {
 impl MetadataMessage {
     pub fn from_bytes(data: &mut Bytes) -> Option<Self> {
         bendy::serde::from_bytes(&data).ok()
+    }
+
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        bendy::serde::to_bytes(self).ok()
     }
 }
 
@@ -103,18 +116,97 @@ impl Serialize for MetadataMessage {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct MetadataExtension {
+    metadata: Option<Box<[u8]>>,
+    pieces: BitVec,
+}
+
 #[derive(Debug)]
-pub struct MetadataExtension {}
+pub enum MetadataError {
+    TooLarge,
+    Rejected,
+    MissingSize,
+    DeserializeFailed,
+    InvalidDataSize,
+}
+
+impl std::error::Error for MetadataError {}
+
+impl Display for MetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self, f)
+    }
+}
 
 impl ExtensionPlugin for MetadataExtension {
-    fn process(&mut self, data: &mut bytes::Bytes) {
-        if let Some(msg) = MetadataMessage::from_bytes(data){
-            
+    fn process(&mut self, data: &mut Bytes) -> Result<Option<Bytes>, std::io::Error> {
+        if let Some(msg) = MetadataMessage::from_bytes(data) {
+            match msg {
+                MetadataMessage::Request { .. } => {
+                    let reply = MetadataMessage::Reject.to_bytes();
+                    if let Some(reply) = reply {
+                        Ok(Some(reply.into()))
+                    } else {
+                        Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            MetadataError::DeserializeFailed,
+                        ))
+                    }
+                }
+                MetadataMessage::Data { piece, total_size } => {
+                    if let Some(ref mut metadata) = self.metadata {
+                        let start = piece * (16 * KB as usize);
+                        let end = start + total_size;
+
+                        if end > metadata.len() {
+                            return Err(io::Error::new(
+                                ErrorKind::InvalidData,
+                                MetadataError::InvalidDataSize,
+                            ));
+                        }
+
+                        let data = data.split_off(data.len() - total_size);
+                        metadata[start..end].copy_from_slice(&data);
+                        *self.pieces.get_mut(piece).unwrap() = false;
+
+                        Ok(None)
+                    } else {
+                        Err(io::Error::new(
+                            ErrorKind::InvalidData,
+                            MetadataError::MissingSize,
+                        ))
+                    }
+                }
+                MetadataMessage::Reject => Err(io::Error::new(
+                    ErrorKind::ConnectionRefused,
+                    MetadataError::Rejected,
+                )),
+            }
+        } else {
+            Ok(None)
         }
     }
 
     fn msg_name(&self) -> &'static str {
         "ut_metadata"
+    }
+
+    fn handshake(&mut self, handshake: &super::ExtensionHandshake) -> Result<(), io::Error> {
+        if let Some(size) = handshake.matadata_size {
+            if size > 512 * KB {
+                warn!("Metadata size {} too large", size);
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    MetadataError::TooLarge,
+                ));
+            }
+            if self.metadata.is_none() {
+                self.metadata = Some(vec![0; size as usize].into_boxed_slice());
+                self.pieces.resize(size as usize, false);
+            }
+        }
+        Ok(())
     }
 }
 

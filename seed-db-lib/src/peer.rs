@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fmt::Display, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, fmt::Display, io, mem::size_of, net::SocketAddr, sync::Arc,
+    time::Duration,
+};
 
 use bitflags::bitflags;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -116,12 +119,15 @@ impl Default for PeerConnectionState {
 
 pub trait ExtensionPlugin: std::fmt::Debug + Send {
     fn resister(&mut self, _connection: &mut PeerConnection) {}
-    fn process(&mut self, msg: &mut Bytes);
+    fn process(&mut self, msg: &mut Bytes) -> Result<Option<Bytes>, io::Error>;
+    fn handshake(&mut self, handshake: &ExtensionHandshake) -> Result<(), io::Error>;
     fn msg_name(&self) -> &'static str;
 }
 
+pub type PeerSink = SplitSink<Framed<TcpStream, LengthDelimitedCodec>, Bytes>;
+
 pub struct PeerConnection {
-    sink: SplitSink<Framed<TcpStream, LengthDelimitedCodec>, bytes::Bytes>,
+    sink: Arc<Mutex<PeerSink>>,
     info_hash: Box<InfoHash>,
     local_peer_id: Box<PeerId>,
     remote_peer_id: Box<PeerId>,
@@ -186,9 +192,16 @@ impl PeerConnection {
             .big_endian()
             .new_framed(stream)
             .split();
+        let sink = Arc::new(Mutex::new(sink));
         let state: Arc<Mutex<PeerConnectionState>> = Default::default();
         let state_changed: Arc<Notify> = Default::default();
-        Self::start_listen_thread(stream, state.clone(), state_changed.clone());
+        state
+            .lock()
+            .await
+            .handlers
+            .push(Box::new(metadata::MetadataExtension::default()));
+            
+        Self::start_listen_thread(stream, sink.clone(), state.clone(), state_changed.clone());
 
         Ok(Self {
             sink,
@@ -204,27 +217,31 @@ impl PeerConnection {
 
     fn start_listen_thread(
         mut stream: SplitStream<Framed<TcpStream, LengthDelimitedCodec>>,
+        sink: Arc<Mutex<PeerSink>>,
         state: Arc<Mutex<PeerConnectionState>>,
         state_changed: Arc<Notify>,
     ) {
         spawn(async move {
-            while let Some(mut data) = stream.try_next().await.ok().flatten() {
+            while let Some(mut data) = stream.try_next().await? {
                 let msg_id = data.get_u8();
                 match msg_id {
                     LT_EXTENSION_MSG_ID => {
-                        Self::handle_extension_msg(data.freeze(), &state, &state_changed).await;
+                        Self::handle_extension_msg(data.freeze(), &sink, &state, &state_changed)
+                            .await?;
                     }
                     _ => (),
                 }
             }
+            Ok::<(), io::Error>(())
         });
     }
 
     async fn handle_extension_msg(
         mut data: Bytes,
+        sink: &Arc<Mutex<PeerSink>>,
         state: &Arc<Mutex<PeerConnectionState>>,
         state_changed: &Arc<Notify>,
-    ) {
+    ) -> Result<(), std::io::Error> {
         let extended_id = data.get_u8();
         if extended_id == HANDSHAKE_EXTENDED_MSG_ID {
             let handshake: ExtensionHandshake = bendy::serde::from_bytes(&data).unwrap();
@@ -235,21 +252,35 @@ impl PeerConnection {
             state_changed.notify_one();
         } else {
             let mut state = state.lock().await;
-            let handler = state
+            let msg_name = state
                 .local_extension
                 .iter()
                 .find(|(_, ext_id)| **ext_id == extended_id)
-                .map(|p| p.0.to_owned())
-                .and_then(|msg_name| {
-                    state
-                        .handlers
-                        .iter_mut()
-                        .find(|ext| ext.msg_name() == msg_name)
-                });
-            if let Some(handler) = handler {
-                handler.process(&mut data);
+                .map(|p| p.0.to_owned());
+            let remote_ext_id = msg_name.as_ref().and_then(|name| {
+                state
+                    .remote_extension
+                    .as_ref()
+                    .and_then(|exts| exts.get(name).copied())
+            });
+            let handler = msg_name.and_then(|msg_name| {
+                state
+                    .handlers
+                    .iter_mut()
+                    .find(|ext| ext.msg_name() == msg_name)
+            });
+            if let (Some(handler), Some(remote_ext_id)) = (handler, remote_ext_id) {
+                let reply = handler.process(&mut data)?;
+                if let Some(reply) = reply {
+                    let mut buf = BytesMut::with_capacity(reply.len() + 2 * size_of::<u8>());
+                    buf.put_u8(LT_EXTENSION_MSG_ID);
+                    buf.put_u8(remote_ext_id);
+                    buf.put(reply);
+                    sink.lock().await.send(buf.freeze()).await?;
+                }
             }
         }
+        Ok(())
     }
 
     pub async fn extension_handshake(&mut self) -> Result<bool, io::Error> {
@@ -277,7 +308,7 @@ impl PeerConnection {
         };
 
         buf.put(bendy::serde::to_bytes(&handshake).unwrap().as_ref());
-        self.sink.send(buf.freeze()).await?;
+        self.sink.lock().await.send(buf.freeze()).await?;
         self.state.lock().await.local_extension = handshake.messages;
 
         for _ in 0..5 {

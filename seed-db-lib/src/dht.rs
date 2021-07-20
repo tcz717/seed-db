@@ -390,8 +390,9 @@ where
                     DhtQuery::AnnouncePeer { info_hash, .. } => {
                         self.seeds.insert(info_hash.clone());
                         info!(
-                            "Got seed hash: {} ({} in total)",
+                            "Got seed hash: {} from {} ({} in total)",
                             info_hash,
+                            addr,
                             self.seeds.len()
                         );
                         self.reply_ping(transaction_id, &addr).await
@@ -402,8 +403,9 @@ where
                     DhtQuery::GetPeers { info_hash, .. } => {
                         self.seeds.insert(info_hash.clone());
                         info!(
-                            "Got seed hash: {} ({} in total)",
+                            "Got seed hash: {} from {} ({} in total)",
                             info_hash,
+                            addr,
                             self.seeds.len()
                         );
                         self.reply_get_peers(transaction_id, info_hash, &addr).await
