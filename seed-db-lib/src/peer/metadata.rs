@@ -1,18 +1,26 @@
 use std::{
+    any::Any,
     fmt::Display,
     io::{self, ErrorKind},
+    sync::Arc,
+    time::Duration,
 };
 
 use bitvec::prelude::*;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
+use futures::SinkExt;
 use log::warn;
 use serde::{
     de::{Error, Unexpected, Visitor},
     ser::SerializeMap,
     Deserialize, Serialize,
 };
+use tokio::{spawn, sync::Mutex};
 
-use super::ExtensionPlugin;
+use super::{
+    ExtensionPlugin, ExtensionPluginName, PeerConnectionState, PeerSink,
+    LT_EXTENSION_MSG_ID,
+};
 
 const KB: u64 = 1024;
 
@@ -116,10 +124,83 @@ impl Serialize for MetadataMessage {
     }
 }
 
+#[derive(Debug)]
+struct MetadataDownloadProgress {
+    metadata: Box<[u8]>,
+    pieces: BitVec,
+}
+
+impl MetadataDownloadProgress {
+    fn new(pieces: usize) -> Self {
+        Self {
+            metadata: vec![0; pieces].into_boxed_slice(),
+            pieces: bitvec![0;pieces],
+        }
+    }
+}
+#[derive(Debug)]
+pub struct MetadataDownload {
+    progress: Arc<Mutex<MetadataDownloadProgress>>,
+    sink: Arc<Mutex<PeerSink>>,
+    remote_ext_id: u8,
+}
+
+impl MetadataDownload {
+    pub async fn run(self) -> Result<Option<Box<[u8]>>, std::io::Error> {
+        spawn(async move {
+            while let Some((next_piece, _)) = self
+                .progress
+                .lock()
+                .await
+                .pieces
+                .iter()
+                .by_val()
+                .enumerate()
+                .find(|(_, p)| *p)
+            {
+                let request = MetadataMessage::Request { piece: next_piece };
+                let mut buf = BytesMut::new();
+
+                buf.put_u8(LT_EXTENSION_MSG_ID);
+                buf.put_u8(self.remote_ext_id);
+                buf.put(request.to_bytes().unwrap().as_slice());
+                self.sink.lock().await.send(buf.freeze()).await?;
+
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Ok::<Option<Box<[u8]>>, io::Error>(None)
+        })
+        .await
+        .unwrap()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MetadataExtension {
-    metadata: Option<Box<[u8]>>,
-    pieces: BitVec,
+    progress: Option<Arc<Mutex<MetadataDownloadProgress>>>,
+    sink: Option<Arc<Mutex<PeerSink>>>,
+}
+
+impl MetadataExtension {
+    pub fn request_all_metadata(
+        &self,
+        state: &PeerConnectionState,
+    ) -> Result<MetadataDownload, MetadataError> {
+        let sink = self.sink.as_ref().ok_or(MetadataError::NotInit)?.clone();
+        let progress = self
+            .progress
+            .as_ref()
+            .ok_or(MetadataError::MissingSize)?
+            .clone();
+        let remote_ext_id = state
+            .get_remote_ext_id(self.msg_name())
+            .ok_or(MetadataError::NotInit)?;
+        Ok(MetadataDownload {
+            progress,
+            sink,
+            remote_ext_id,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -129,6 +210,7 @@ pub enum MetadataError {
     MissingSize,
     DeserializeFailed,
     InvalidDataSize,
+    NotInit,
 }
 
 impl std::error::Error for MetadataError {}
@@ -139,9 +221,17 @@ impl Display for MetadataError {
     }
 }
 
+impl ExtensionPluginName for MetadataExtension {
+    fn msg_name() -> &'static str {
+        "ut_metadata"
+    }
+}
+
+#[async_trait::async_trait]
 impl ExtensionPlugin for MetadataExtension {
-    fn process(&mut self, data: &mut Bytes) -> Result<Option<Bytes>, std::io::Error> {
+    async fn process(&mut self, data: &mut Bytes) -> Result<Option<Bytes>, std::io::Error> {
         if let Some(msg) = MetadataMessage::from_bytes(data) {
+            println!("{:#?}", msg);
             match msg {
                 MetadataMessage::Request { .. } => {
                     let reply = MetadataMessage::Reject.to_bytes();
@@ -155,11 +245,12 @@ impl ExtensionPlugin for MetadataExtension {
                     }
                 }
                 MetadataMessage::Data { piece, total_size } => {
-                    if let Some(ref mut metadata) = self.metadata {
+                    if let Some(ref mut metadata) = self.progress {
+                        let mut progress = metadata.lock().await;
                         let start = piece * (16 * KB as usize);
                         let end = start + total_size;
 
-                        if end > metadata.len() {
+                        if end > progress.metadata.len() {
                             return Err(io::Error::new(
                                 ErrorKind::InvalidData,
                                 MetadataError::InvalidDataSize,
@@ -167,8 +258,8 @@ impl ExtensionPlugin for MetadataExtension {
                         }
 
                         let data = data.split_off(data.len() - total_size);
-                        metadata[start..end].copy_from_slice(&data);
-                        *self.pieces.get_mut(piece).unwrap() = false;
+                        progress.metadata[start..end].copy_from_slice(&data);
+                        *progress.pieces.get_mut(piece).unwrap() = false;
 
                         Ok(None)
                     } else {
@@ -201,12 +292,21 @@ impl ExtensionPlugin for MetadataExtension {
                     MetadataError::TooLarge,
                 ));
             }
-            if self.metadata.is_none() {
-                self.metadata = Some(vec![0; size as usize].into_boxed_slice());
-                self.pieces.resize(size as usize, false);
+            if self.progress.is_none() {
+                self.progress = Some(Arc::new(Mutex::new(MetadataDownloadProgress::new(
+                    size as usize,
+                ))));
             }
         }
         Ok(())
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

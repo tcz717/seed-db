@@ -24,6 +24,7 @@ itertools = "0.*"
 log = "0.*"
 bitflags = "1.*"
 bitvec = "0.22"
+async-trait = "0.1.50"
 
 [dev-dependencies]
 tokio = { version = "1.*", features = ["net", "rt", "macros"] }

@@ -1,6 +1,6 @@
 use std::{
-    collections::HashMap, fmt::Display, io, mem::size_of, net::SocketAddr, sync::Arc,
-    time::Duration,
+    any::Any, collections::HashMap, fmt::Display, io, mem::size_of, net::SocketAddr, ops::Deref,
+    sync::Arc, time::Duration,
 };
 
 use bitflags::bitflags;
@@ -100,7 +100,35 @@ pub struct PeerConnectionState {
     remote_chock: bool,
     local_extension: ExtensionMessages,
     remote_extension: Option<ExtensionMessages>,
-    handlers: Vec<Box<dyn ExtensionPlugin>>,
+    handlers: Vec<Box<dyn ExtensionPlugin + 'static>>,
+}
+
+impl PeerConnectionState {
+    pub fn get_extension<Ext: ExtensionPluginName + 'static>(&self) -> Option<&Ext> {
+        // TODO find by name?
+        self.handlers
+            .iter()
+            .find_map(|ext| ext.as_any().downcast_ref())
+    }
+    pub fn get_extension_mut<Ext: ExtensionPluginName + 'static>(&mut self) -> Option<&mut Ext> {
+        // TODO find by name?
+        self.handlers
+            .iter_mut()
+            .find_map(|ext| ext.as_any_mut().downcast_mut())
+    }
+
+    pub fn get_remote_ext_id(&self, name: &str) -> Option<u8> {
+        self.remote_extension
+            .as_ref()
+            .and_then(|exts| exts.get(name).copied())
+    }
+
+    pub fn lookup_local_msg_name(&self, extended_id: u8) -> Option<&String> {
+        self.local_extension
+            .iter()
+            .find(|(_, ext_id)| **ext_id == extended_id)
+            .map(|p| p.0)
+    }
 }
 
 impl Default for PeerConnectionState {
@@ -117,14 +145,23 @@ impl Default for PeerConnectionState {
     }
 }
 
+#[async_trait::async_trait]
 pub trait ExtensionPlugin: std::fmt::Debug + Send {
     fn resister(&mut self, _connection: &mut PeerConnection) {}
-    fn process(&mut self, msg: &mut Bytes) -> Result<Option<Bytes>, io::Error>;
+    async fn process(&mut self, msg: &mut Bytes) -> Result<Option<Bytes>, io::Error>;
     fn handshake(&mut self, handshake: &ExtensionHandshake) -> Result<(), io::Error>;
     fn msg_name(&self) -> &'static str;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub trait ExtensionPluginName: ExtensionPlugin {
+    fn msg_name() -> &'static str;
 }
 
 pub type PeerSink = SplitSink<Framed<TcpStream, LengthDelimitedCodec>, Bytes>;
+
+pub type SharedConnectionState = Arc<Mutex<PeerConnectionState>>;
 
 pub struct PeerConnection {
     sink: Arc<Mutex<PeerSink>>,
@@ -132,7 +169,7 @@ pub struct PeerConnection {
     local_peer_id: Box<PeerId>,
     remote_peer_id: Box<PeerId>,
     reserved_bits: PeerReservedBit,
-    state: Arc<Mutex<PeerConnectionState>>,
+    state: SharedConnectionState,
     state_changed: Arc<Notify>,
 }
 
@@ -141,13 +178,14 @@ impl PeerConnection {
         addr: &SocketAddr,
         info_hash: &InfoHash,
         local_peer_id: &PeerId,
-        reserved: PeerReservedBit,
     ) -> Result<PeerConnection, io::Error> {
         let mut stream = TcpStream::connect(addr).await?;
         stream.write_u8(19).await?;
         stream.write_all(BIT_TORRENT_PROTOCOL).await?;
         stream.write_all(&[0u8; 8]).await?;
         stream.write_all(info_hash.as_ref()).await?;
+
+        println!("Sent handshake");
 
         if stream.read_u8().await? != 19 {
             return Err(io::Error::new(
@@ -187,6 +225,8 @@ impl PeerConnection {
         stream.read_exact(&mut remote_peer_id).await?;
         let remote_peer_id = PeerId::new(&remote_peer_id);
 
+        println!("Handshake done");
+
         let (sink, stream) = length_delimited::Builder::new()
             .length_field_length(4)
             .big_endian()
@@ -200,7 +240,7 @@ impl PeerConnection {
             .await
             .handlers
             .push(Box::new(metadata::MetadataExtension::default()));
-            
+
         Self::start_listen_thread(stream, sink.clone(), state.clone(), state_changed.clone());
 
         Ok(Self {
@@ -209,7 +249,7 @@ impl PeerConnection {
             local_peer_id: Box::new(local_peer_id.clone()),
             remote_peer_id: Box::new(remote_peer_id.clone()),
             reserved_bits: PeerReservedBit::from_bits_truncate(u64::from_be_bytes(reserved_bytes))
-                & reserved,
+                & PeerReservedBit::SUPPORTED,
             state,
             state_changed,
         })
@@ -252,17 +292,10 @@ impl PeerConnection {
             state_changed.notify_one();
         } else {
             let mut state = state.lock().await;
-            let msg_name = state
-                .local_extension
-                .iter()
-                .find(|(_, ext_id)| **ext_id == extended_id)
-                .map(|p| p.0.to_owned());
-            let remote_ext_id = msg_name.as_ref().and_then(|name| {
-                state
-                    .remote_extension
-                    .as_ref()
-                    .and_then(|exts| exts.get(name).copied())
-            });
+            let msg_name = state.lookup_local_msg_name(extended_id).cloned();
+            let remote_ext_id = msg_name
+                .as_ref()
+                .and_then(|name| state.get_remote_ext_id(name));
             let handler = msg_name.and_then(|msg_name| {
                 state
                     .handlers
@@ -270,7 +303,7 @@ impl PeerConnection {
                     .find(|ext| ext.msg_name() == msg_name)
             });
             if let (Some(handler), Some(remote_ext_id)) = (handler, remote_ext_id) {
-                let reply = handler.process(&mut data)?;
+                let reply = handler.process(&mut data).await?;
                 if let Some(reply) = reply {
                     let mut buf = BytesMut::with_capacity(reply.len() + 2 * size_of::<u8>());
                     buf.put_u8(LT_EXTENSION_MSG_ID);
@@ -335,5 +368,53 @@ impl PeerConnection {
     /// Get a reference to the peer connection's info hash.
     pub fn info_hash(&self) -> &InfoHash {
         self.info_hash.as_ref()
+    }
+}
+
+impl Deref for PeerConnection {
+    type Target = Arc<Mutex<PeerConnectionState>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{convert::TryInto, net::SocketAddr, str::FromStr};
+
+    use crate::{
+        dht::InfoHash,
+        peer::{metadata::MetadataExtension, PeerConnection},
+    };
+
+    #[tokio::test]
+    async fn get_metadata() {
+        let addr = SocketAddr::from_str("45.147.196.162:48724").unwrap();
+        let hash = base64::decode("pdOV1q5SkEnx8bvp67Om2zyHDOE=").unwrap();
+
+        assert_eq!(hash.len(), 20);
+        let hash = InfoHash::new(hash.as_slice().try_into().unwrap());
+        let local_id = InfoHash::random();
+
+        let mut connection = PeerConnection::connect(&addr, &hash, &local_id)
+            .await
+            .unwrap();
+
+        assert_eq!(connection.extension_handshake().await.unwrap(), true);
+
+        let res = {
+            let state = connection.lock().await;
+            let handler = state.get_extension::<MetadataExtension>().unwrap();
+            handler.request_all_metadata(&state)
+        }
+        .unwrap()
+        .run()
+        .await
+        .ok()
+        .flatten()
+        .unwrap();
+
+        assert!(res.len() > 0)
     }
 }
