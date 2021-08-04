@@ -1,5 +1,5 @@
 use log::LevelFilter;
-use seed_db_lib::{dht::DhtClient, route::kademila::KademilaRouter};
+use seed_db_lib::{crawler::SeedCrawler, dht::DhtClient, route::kademila::KademilaRouter};
 use tokio::{runtime::Builder, signal::ctrl_c};
 
 fn main() {
@@ -20,7 +20,10 @@ fn main() {
                 "dht.aelitis.com:6881",
             ])
             .await;
-        let _ = client.run();
+        let controller = client.run();
+        let mut crawler = SeedCrawler::new(controller);
+
+        crawler.crawl().await;
         ctrl_c().await
     })
     .unwrap();

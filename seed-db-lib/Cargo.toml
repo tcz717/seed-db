@@ -9,22 +9,32 @@ edition = "2018"
 [dependencies]
 tokio = { version = "1.*", features = ["net"] }
 tokio-util = { version = "0.*", features = ["net", "codec"] }
+tokio-stream = "0.*"
 bytes = "1.*"
 serde = { version = "1.*", features = ["derive"] }
+serde_bytes = "0.*"
+base64 = "0.*"
+futures = "0.*"
+rand = "0.*"
+itertools = "0.*"
+log = "0.*"
+bitflags = "1.*"
+bitvec = "0.*"
+async-trait = "0.1"
+hex = "0.4"
+rust-crypto = "0.2"
+hashbrown = "0.11"
+lru_time_cache = "0.11"
+
 bendy = { git = 'https://github.com/tcz717/bendy.git', branch = 'no-sort', features = [
     "std",
     "serde",
 ] }
-base64 = "0.*"
-futures = "0.*"
-serde_bytes = "0.*"
-rand = "0.*"
-rupnp = "1.*"
-itertools = "0.*"
-log = "0.*"
-bitflags = "1.*"
-bitvec = "0.22"
-async-trait = "0.1.50"
+
+rupnp = { version = "1.*", optional = true }
+
+[features]
+nat-traversal = ["rupnp"]
 
 [dev-dependencies]
 tokio = { version = "1.*", features = ["net", "rt", "macros"] }

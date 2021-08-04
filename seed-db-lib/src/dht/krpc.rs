@@ -1,5 +1,5 @@
-use super::utils::{BytesSliceVisitor, BytesVisitor};
 use super::{DhtNode, DhtNodeId, InfoHash};
+use crate::utils::{BorrowedBytesVisitor, BytesSliceVisitor, BytesVisitor};
 use serde::{Deserialize, Serialize, Serializer};
 use std::convert::{TryFrom, TryInto};
 use std::fmt::Debug;
@@ -76,7 +76,8 @@ pub enum DhtQuery<'a> {
         implied_port: Option<bool>,
         info_hash: &'a InfoHash,
         port: u16,
-        token: &'a str,
+        #[serde(with = "serde_bytes")]
+        token: &'a [u8],
     },
     FindNode {
         id: &'a DhtNodeId,
@@ -93,16 +94,16 @@ pub enum DhtQuery<'a> {
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 #[serde(untagged)]
 pub enum DhtResponse<'a> {
-    FindNode {
-        id: &'a DhtNodeId,
-        nodes: DhtNodeCompactList<'a>,
-    },
     GetPeers {
         id: &'a DhtNodeId,
         #[serde(with = "serde_bytes")]
         token: &'a [u8],
         #[serde(flatten)]
         result: GetPeersResult<'a>,
+    },
+    FindNode {
+        id: &'a DhtNodeId,
+        nodes: DhtNodeCompactList<'a>,
     },
     PingOrAnnouncePeer {
         id: &'a DhtNodeId,
@@ -215,13 +216,13 @@ impl DhtNodeCompact {
     }
 }
 
-impl Into<DhtNode> for &DhtNodeCompact {
-    fn into(self) -> DhtNode {
+impl From<&DhtNodeCompact> for DhtNode {
+    fn from(val: &DhtNodeCompact) -> Self {
         DhtNode {
-            id: DhtNodeId::new(self.0[0..20].try_into().unwrap()),
+            id: DhtNodeId::new(val.0[0..20].try_into().unwrap()),
             addr: SocketAddr::from((
-                Ipv4Addr::from(<&[u8; 4]>::try_from(&self.0[20..24]).unwrap().to_owned()),
-                u16::from_be_bytes(self.0[24..26].try_into().unwrap()),
+                Ipv4Addr::from(<&[u8; 4]>::try_from(&val.0[20..24]).unwrap().to_owned()),
+                u16::from_be_bytes(val.0[24..26].try_into().unwrap()),
             )),
         }
     }
@@ -268,7 +269,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for &'a DhtNodeCompact {
         D: serde::Deserializer<'de>,
     {
         deserializer
-            .deserialize_bytes(BytesVisitor::<26>)
+            .deserialize_bytes(BorrowedBytesVisitor::<26>)
             .map(|bytes| unsafe { &*(bytes.as_ptr() as *const _) })
     }
 }
@@ -352,7 +353,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for &'a DhtPeerCompact {
         D: serde::Deserializer<'de>,
     {
         deserializer
-            .deserialize_bytes(BytesVisitor::<6>)
+            .deserialize_bytes(BorrowedBytesVisitor::<6>)
             .map(|bytes| unsafe { &*(bytes.as_ptr() as *const _) })
     }
 }
@@ -368,7 +369,7 @@ pub fn from_bytes(buf: &[u8]) -> Result<KRpc<'_>, bencode::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     use crate::dht::{
         krpc::{DhtNodeCompactListOwned, DhtQuery, DhtResponse, GetPeersResult, KRpc, KRpcBody},
@@ -402,7 +403,7 @@ mod tests {
                 implied_port: Some(true),
                 info_hash: &info_hash,
                 port: 6881,
-                token: "aoeusnth",
+                token: b"aoeusnth",
             }),
             version: None,
         };
@@ -492,6 +493,104 @@ mod tests {
             packet.unwrap(),
             super::KRpc {
                 body: KRpcBody::Query(super::DhtQuery::GetPeers { .. }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn deserialize_get_peers_response() {
+        let hex=b"64323a6970363a753cb72f1655313a7264323a696432303ada9ce84884e256606658fb8405b71ed68be4904b353a6e6f6465733230383adf46cb3d7b97fdad258f37b9ce8bf033d5d9146c6a69b26220fedc4c43a936178c467149c9a69c043254fbbd623425bb7d3fc8d5dea2623124c37d782f66450c72a9db8c89d0ddddde6972877e03ddbe3a8baf115aefdf52ad83b9865834f1f139aaa3ac0aa6c8d5dd93d5cb40950b670259657940a3d8ab536bacde7d8b752f1ddfdf473826c506516a4ba8841a7bc87bb0d547d0d7d5eef6e22711df9753279915cdc7e22d7df24db39ea3a27b31587cc22c451ae1de3be10579b969c2f62027e4fe99ca33a9834e232e9299a2bf69313a70693537313765353a746f6b656e343a27071c1665313a74323aee53313a76343a4c540102313a79313a7265";
+
+        let bytes: Vec<_> = from_hex(hex);
+
+        let packet = super::from_bytes(&bytes);
+        assert!(matches!(
+            packet.unwrap(),
+            super::KRpc {
+                body: KRpcBody::Response {
+                    response: super::DhtResponse::GetPeers { .. }
+                },
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn deserialize_get_peers_response_found1() {
+        let hex=b"64313a7264323a696432303a47ae7849b684c81f269c8519e4a1fd5f471cc340353a746f6b656e383a3837383136303235363a76616c7565736c363a7aee9fdb52e9363a1b9cde4121b6363a71f50b151bf3363a7260d20a26a5363a79cf29e362f7363a72609d1c26a5363a3a3ec4d225dd363adfd74d03595e363a1b9cde2e21b6363a3d8cc66b57d0363a74095aa3a552363a6e5ab1e321b6363a71f526d51bf36565313a74323a3424313a79313a7265";
+
+        let bytes: Vec<_> = from_hex(hex);
+
+        let packet = super::from_bytes(&bytes);
+        match packet.unwrap() {
+            super::KRpc {
+                body:
+                    KRpcBody::Response {
+                        response:
+                            super::DhtResponse::GetPeers {
+                                result: GetPeersResult::Found(peers),
+                                ..
+                            },
+                    },
+                ..
+            } => {
+                for peer in &peers {
+                    println!("{:?} = {:?}", peer, peer.0)
+                }
+                assert_eq!(peers[0].addr(), "122.238.159.219:21225".parse().unwrap());
+                assert_eq!(peers[1].addr(), "27.156.222.65:8630".parse().unwrap());
+                assert_eq!(peers[2].addr(), "113.245.11.21:7155".parse().unwrap());
+                assert_eq!(peers[3].addr(), "114.96.210.10:9893".parse().unwrap());
+                assert_eq!(peers[4].addr(), "121.207.41.227:25335".parse().unwrap());
+                assert_eq!(peers[5].addr(), "114.96.157.28:9893".parse().unwrap());
+                assert_eq!(peers[6].addr(), "58.62.196.210:9693".parse().unwrap());
+                assert_eq!(peers[7].addr(), "223.215.77.3:22878".parse().unwrap());
+            }
+            _ => panic!("Not match"),
+        }
+    }
+
+    #[test]
+    fn deserialize_find_nodes_response() {
+        let hex=b"64323a6970363a753cb72f1655313a7264323a696432303acd9dab3cfaa8ea3eff49c088905c46983722beee353a6e6f6465733230383acd9da1be1f0bb73a0b69da80f43fead0dd09331c46342dc84fd7cd9da24d71be8557a63ca35e86649daf3148aaad5f6fe177740bcd9da60a9c7220780ab09110e6bdd36bd593c69d5488cb591ae1cd9da3a59bc2ebfb0278c9b22cfd433fe7c957a0b5a8e9ea1ae1cd9da6e4b72a1a9a9bfc0acefaa3e9b37b33258bb4fb981bebe7cd9da60ee25cd6f349bc9699f245f930c366137372cd9ecca0f3cd9da08c00dfcd8c4e4594056ba6657a4b4c8201bc9a213dc8d5cd9dae5a263e4c5a0ba236280f166d013c0e456e725fd2c22181313a70693537313765353a746f6b656e343a45e621b365313a74323abf04313a76343a4c540101313a79313a7265";
+
+        let bytes: Vec<_> = from_hex(hex);
+
+        let packet = super::from_bytes(&bytes);
+        assert!(matches!(
+            packet.unwrap(),
+            super::KRpc {
+                body: KRpcBody::Response {
+                    response: super::DhtResponse::GetPeers { .. }
+                },
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn deserialize_compact_peer() {
+        let hex = b"363a7271abb192a2";
+
+        let bytes: Vec<_> = from_hex(hex);
+
+        let packet = bendy::serde::from_bytes::<super::DhtPeerCompact>(&bytes);
+        assert_eq!(
+            packet.unwrap().addr(),
+            SocketAddr::V4(SocketAddrV4::new("114.113.171.177".parse().unwrap(), 37538))
+        );
+    }
+
+    #[test]
+    fn deserialize_announce_peer_query_1() {
+        let hex=b"64313a6164323a696432303a832ab4a7493e16d272f9b40c3879d39784047db0393a696e666f5f6861736832303a4307ad94c16ff225cb8ce1a7bfa91e6b6d2f81b1343a706f7274693130373365353a746f6b656e353a406e8ae53d65313a7131333a616e6e6f756e63655f70656572313a74313a0d313a79313a7165";
+
+        let bytes: Vec<_> = from_hex(hex);
+
+        let packet = super::from_bytes(&bytes);
+        assert!(matches!(
+            packet.unwrap(),
+            super::KRpc {
+                body: KRpcBody::Query(super::DhtQuery::AnnouncePeer { .. }),
                 ..
             }
         ));

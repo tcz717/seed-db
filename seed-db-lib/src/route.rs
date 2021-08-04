@@ -13,7 +13,7 @@ pub mod kademila {
     use crate::dht::{DhtNode, DhtNodeId, RouteTable, SharedDhtNode};
 
     pub struct KademilaRouter<const K: usize> {
-        id: DhtNodeId,
+        id: Arc<DhtNodeId>,
         root: KBucket<K>,
         node_count: usize,
         bucket_count: usize,
@@ -23,7 +23,7 @@ pub mod kademila {
     impl<const K: usize> KademilaRouter<K> {
         pub fn new(id: DhtNodeId) -> Self {
             Self {
-                id,
+                id: id.into(),
                 root: KBucket::new(),
                 node_count: 0,
                 bucket_count: 1,
@@ -57,6 +57,7 @@ pub mod kademila {
                         {
                             self.node_count -= 1;
                         }
+                        return;
                     }
                     KBucket::Branch { low, high } => {
                         bucket = if Some(true) == bit.next() { high } else { low };
@@ -119,7 +120,7 @@ pub mod kademila {
     impl<const K: usize> Default for KademilaRouter<K> {
         fn default() -> Self {
             Self {
-                id: DhtNodeId::random(),
+                id: DhtNodeId::random().into(),
                 root: KBucket::new(),
                 node_count: 0,
                 bucket_count: 1,
@@ -182,8 +183,8 @@ pub mod kademila {
             }
         }
 
-        fn id(&self) -> &DhtNodeId {
-            &self.id
+        fn id(&self) -> Arc<DhtNodeId> {
+            self.id.clone()
         }
 
         fn nearests(&self, id: &DhtNodeId) -> Vec<&SharedDhtNode> {

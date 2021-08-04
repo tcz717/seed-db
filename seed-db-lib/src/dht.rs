@@ -1,261 +1,38 @@
+use futures::future::{join_all, JoinAll};
+use hashbrown::hash_map::Entry;
+use hashbrown::{HashMap, HashSet};
 use itertools::Itertools;
 use log::{debug, error, info, trace, warn};
-use serde::de::Visitor;
-use serde::{Deserialize, Serialize, Serializer};
+use lru_time_cache::LruCache;
 use tokio::net::UdpSocket;
 use tokio::net::{lookup_host, ToSocketAddrs};
-use tokio::sync::{mpsc, RwLock};
+use tokio::spawn;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
-use tokio::{join, spawn};
+use tokio::time::{interval, sleep};
+use tokio_stream::wrappers::ReceiverStream;
 
-use std::borrow::Borrow;
-use std::collections::HashSet;
+use std::array::TryFromSliceError;
+use std::collections::BinaryHeap;
 use std::convert::TryInto;
-use std::fmt::{Debug, Display};
+use std::error::Error;
+use std::fmt::Debug;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::dht::krpc::{
     DhtNodeCompactListOwned, DhtQuery, DhtResponse, GetPeersResult, KRpc, KRpcBody,
 };
 
 pub mod krpc;
-mod utils;
+mod node;
 
-#[repr(transparent)]
-#[derive(PartialEq, Eq, PartialOrd, Ord, Default, Clone, Hash)]
-pub struct DhtNodeId([u8; 20]);
-
-impl DhtNodeId {
-    pub const BITS: u32 = u8::BITS * 20;
-    pub fn new(bytes: &[u8; 20]) -> Self {
-        DhtNodeId(bytes.clone())
-    }
-    pub fn zered() -> Self {
-        Default::default()
-    }
-
-    pub fn max() -> Self {
-        DhtNodeId([u8::MAX; 20])
-    }
-
-    pub fn random() -> Self {
-        DhtNodeId(rand::random())
-    }
-
-    pub fn traverse_bits(&self) -> DhtNodeIdBitIter<'_> {
-        DhtNodeIdBitIter::new(self)
-    }
-
-    pub fn set(&mut self, idx: usize) {
-        const WIDTH: usize = u8::BITS as usize;
-        let bit = 1 << (idx % WIDTH);
-        let byte = 19 - idx / WIDTH;
-        self.0[byte] |= bit;
-    }
-    pub fn unset(&mut self, idx: usize) {
-        const WIDTH: usize = u8::BITS as usize;
-        let bit = 1 << (idx % WIDTH);
-        let byte = 19 - idx / WIDTH;
-        self.0[byte] &= !bit;
-    }
-
-    pub fn bit(&self, idx: usize) -> bool {
-        const WIDTH: usize = u8::BITS as usize;
-        let bit = 1 << (idx % WIDTH);
-        let byte = 19 - idx / WIDTH;
-        self.0[byte] & bit > 0
-    }
-
-    pub fn write(&mut self, idx: usize, val: bool) {
-        const WIDTH: usize = u8::BITS as usize;
-        let bit = 1 << (idx % WIDTH);
-        let byte = 19 - idx / WIDTH;
-        self.0[byte] &= !bit;
-        self.0[byte] |= if val { 1 << (idx % WIDTH) } else { 0 }
-    }
-}
-
-impl std::ops::BitXor for &DhtNodeId {
-    type Output = DhtNodeId;
-
-    fn bitxor(self, rhs: Self) -> Self::Output {
-        let mut result = DhtNodeId::default();
-
-        for (i, byte) in result.0.iter_mut().enumerate() {
-            *byte = self.0[i] ^ rhs.0[i];
-        }
-        result
-    }
-}
-
-impl Debug for DhtNodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for i in self.0 {
-            if f.alternate() {
-                write!(f, "{:02X} ", i)?
-            } else {
-                write!(f, "{:02X}", i)?
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Display for DhtNodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", base64::encode(self.0))
-    }
-}
-
-impl AsRef<[u8; 20]> for DhtNodeId {
-    fn as_ref(&self) -> &[u8; 20] {
-        &self.0
-    }
-}
-
-impl Borrow<[u8; 20]> for DhtNodeId {
-    fn borrow(&self) -> &[u8; 20] {
-        &self.0
-    }
-}
-
-impl Into<DhtNodeId> for &[u8; 20] {
-    fn into(self) -> DhtNodeId {
-        DhtNodeId::new(self)
-    }
-}
-
-impl Serialize for DhtNodeId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for DhtNodeId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct DhtNodeIdVisitor;
-        impl<'de> Visitor<'de> for DhtNodeIdVisitor {
-            type Value = DhtNodeId;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("20 bytes Node ID")
-            }
-            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(DhtNodeId::new(v.try_into().map_err(|_| {
-                    serde::de::Error::invalid_length(v.len(), &self)
-                })?))
-            }
-        }
-        deserializer.deserialize_bytes(DhtNodeIdVisitor)
-    }
-}
-
-impl<'a, 'de: 'a> Deserialize<'de> for &'a DhtNodeId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct DhtNodeIdVisitor;
-        impl<'de> Visitor<'de> for DhtNodeIdVisitor {
-            type Value = &'de DhtNodeId;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("20 bytes Node ID")
-            }
-            fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                let bytes = TryInto::<&[u8; 20]>::try_into(v)
-                    .map_err(|_| serde::de::Error::invalid_length(v.len(), &self))?;
-                Ok(unsafe { &*(bytes.as_ptr() as *const _) })
-            }
-        }
-        deserializer.deserialize_bytes(DhtNodeIdVisitor)
-    }
-}
-
-pub struct DhtNodeIdBitIter<'a> {
-    id: &'a DhtNodeId,
-    head: usize,
-    tail: usize,
-}
-
-impl<'a> DhtNodeIdBitIter<'a> {
-    pub fn new(id: &'a DhtNodeId) -> Self {
-        Self {
-            id,
-            head: 0,
-            tail: DhtNodeId::BITS as usize,
-        }
-    }
-}
-
-impl<'a> Iterator for DhtNodeIdBitIter<'a> {
-    type Item = bool;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.head < self.tail {
-            let bit = Some(self.id.bit(self.head));
-            self.head += 1;
-            bit
-        } else {
-            None
-        }
-    }
-}
-impl<'a> DoubleEndedIterator for DhtNodeIdBitIter<'a> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.head < self.tail {
-            self.tail -= 1;
-            Some(self.id.bit(self.head))
-        } else {
-            None
-        }
-    }
-}
-
-pub type InfoHash = DhtNodeId;
-
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct DhtNode {
-    pub id: DhtNodeId,
-    pub addr: SocketAddr,
-}
-
-impl DhtNode {
-    pub fn new(id: DhtNodeId, addr: SocketAddr) -> Self {
-        Self { id: id, addr }
-    }
-
-    /// Get a reference to the dht node's id.
-    pub fn id(&self) -> &DhtNodeId {
-        &self.id
-    }
-}
-
-impl Display for DhtNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Node<{}, {}>", self.id, self.addr)
-    }
-}
-
-pub type SharedDhtNode = Arc<DhtNode>;
+pub use node::*;
 
 pub trait RouteTable {
-    fn id(&self) -> &DhtNodeId;
+    fn id(&self) -> Arc<DhtNodeId>;
     fn update(&mut self, node: DhtNode);
     fn nodes_count(&self) -> usize;
     fn nearests(&self, id: &DhtNodeId) -> Vec<&SharedDhtNode>;
@@ -269,26 +46,129 @@ pub struct DhtClient<R: RouteTable> {
     trackers: Vec<SocketAddr>,
     router: Arc<RwLock<R>>,
     next_transaction_id: u16,
-    id: DhtNodeId,
-    /// To be removed in the future
-    seeds: std::collections::HashSet<InfoHash>,
+    id: Arc<DhtNodeId>,
+    peer_lookup_tasks: Arc<Mutex<HashMap<InfoHash, PeerLookupTask>>>,
+    get_peers_waiters: Arc<Mutex<LruCache<GetPeersRequestIndex, InfoHash>>>,
+}
+
+pub enum InfoHashObservation {
+    WithPeerAddr {
+        info_hash: Arc<InfoHash>,
+        peer_addr: SocketAddr,
+    },
+    WithUtpPeerAddr {
+        info_hash: Arc<InfoHash>,
+        utp_addr: SocketAddr,
+    },
+    WithDhtNode {
+        info_hash: Arc<InfoHash>,
+        node: DhtNode,
+    },
+}
+
+#[derive(Debug)]
+struct PeerLookupTask {
+    info_hash: Arc<InfoHash>,
+    result: oneshot::Sender<Vec<SocketAddr>>,
+    cloest_nodes: BinaryHeap<OrderedNode>,
+    start_time: Instant,
+    visited: HashSet<SocketAddr>,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone)]
+struct GetPeersRequestIndex {
+    node: DhtNode,
+    tid: u16,
+}
+
+impl GetPeersRequestIndex {
+    pub fn new(
+        id: &DhtNodeId,
+        addr: SocketAddr,
+        transaction_id: &[u8],
+    ) -> Result<GetPeersRequestIndex, TryFromSliceError> {
+        Ok(GetPeersRequestIndex {
+            node: DhtNode {
+                id: id.clone(),
+                addr,
+            },
+            tid: u16::from_be_bytes(transaction_id.try_into()?),
+        })
+    }
+    pub fn new_with_node(
+        node: &DhtNode,
+        transaction_id: &[u8],
+    ) -> Result<GetPeersRequestIndex, TryFromSliceError> {
+        Ok(GetPeersRequestIndex {
+            node: node.clone(),
+            tid: u16::from_be_bytes(transaction_id.try_into()?),
+        })
+    }
+}
+
+pub struct PeerLookupSender(Sender<PeerLookupTask>, Arc<DhtNodeId>);
+
+impl PeerLookupSender {
+    pub async fn lookup_peers(
+        &self,
+        info_hash: &InfoHash,
+        init_node: Option<&DhtNode>,
+    ) -> Result<Vec<SocketAddr>, Box<dyn Error>> {
+        let (tx, rx) = oneshot::channel();
+        self.0
+            .send_timeout(
+                PeerLookupTask {
+                    info_hash: Arc::new(info_hash.clone()),
+                    result: tx,
+                    cloest_nodes: init_node
+                        .map(|node| node.distence_order(&self.1))
+                        .into_iter()
+                        .collect(),
+                    start_time: Instant::now(),
+                    visited: Default::default(),
+                },
+                Duration::from_millis(500),
+            )
+            .await?;
+
+        Ok(rx.await?)
+    }
 }
 
 pub struct DhtClientController {
-    main: JoinHandle<()>,
-    route_maintaining: JoinHandle<()>,
-    find_node_sender: JoinHandle<()>,
-    crawler: JoinHandle<()>,
+    main: JoinAll<tokio::task::JoinHandle<()>>,
+    info_hash_observer: ReceiverStream<InfoHashObservation>,
+    peer_lockup: Sender<PeerLookupTask>,
+    id: Arc<DhtNodeId>,
 }
 
+// impl Drop for DhtClientController {
+//     fn drop(&mut self) {
+//         spawn(self.main).abort()
+//     }
+// }
+
 impl DhtClientController {
-    pub async fn stop(self) {
-        let _ = join!(
-            self.main,
-            self.route_maintaining,
-            self.find_node_sender,
-            self.crawler
-        );
+    pub fn stop(self) {
+        spawn(self.main).abort()
+    }
+
+    /// Get a mutable reference to the dht client controller's info hash observer.
+    pub fn info_hash_observer(&mut self) -> &mut ReceiverStream<InfoHashObservation> {
+        &mut self.info_hash_observer
+    }
+
+    /// Get a clone to the dht client controller's id.
+    pub fn id(&self) -> Arc<DhtNodeId> {
+        self.id.clone()
+    }
+
+    /// Get a clone to the dht client controller's peer lockup.
+    pub fn sender(&self) -> Arc<Mutex<PeerLookupSender>> {
+        Arc::new(Mutex::new(PeerLookupSender(
+            self.peer_lockup.clone(),
+            self.id.clone(),
+        )))
     }
 }
 
@@ -303,7 +183,10 @@ impl<R: RouteTable + Default> DhtClient<R> {
             router,
             next_transaction_id: Default::default(),
             id,
-            seeds: Default::default(),
+            peer_lookup_tasks: Default::default(),
+            get_peers_waiters: Arc::new(Mutex::new(LruCache::with_expiry_duration(
+                Duration::from_secs(5),
+            ))),
         })
     }
 }
@@ -329,13 +212,25 @@ where
     }
 
     pub fn run(mut self) -> DhtClientController {
+        let (find_info_hash, info_hash_observer) = mpsc::channel::<InfoHashObservation>(32);
+        let (peer_lockup, peer_lockup_rx) = mpsc::channel::<PeerLookupTask>(32);
         let (find_node, rx) = mpsc::channel::<SocketAddr>(128);
+
         let route_maintaining = Self::start_route_maintaining_thread(
             self.router.clone(),
             self.trackers.clone(),
             find_node.clone(),
         );
-        let find_node_sender = Self::start_find_node_thread(self.id.clone(), self.udp.clone(), rx);
+        let myid = self.id.clone();
+        let peer_lookup_task = Self::start_lookup_peer_thread(
+            myid.clone(),
+            self.router.clone(),
+            self.udp.clone(),
+            self.peer_lookup_tasks.clone(),
+            self.get_peers_waiters.clone(),
+            peer_lockup_rx,
+        );
+        let find_node_sender = Self::start_find_node_thread(myid.clone(), self.udp.clone(), rx);
         let crawler = Self::start_crawler_thread(self.router.clone(), find_node.clone());
 
         let main = spawn(async move {
@@ -346,13 +241,13 @@ where
                         debug!("{:?} bytes received from {:?}", len, addr);
 
                         if let Ok(packet) = krpc::from_bytes(&buf[0..len]) {
-                            // println!("{:#?} packet received", packet);
                             if let Some(id) = packet.node_id() {
                                 let node = DhtNode::new(id.clone(), addr.clone());
                                 trace!("Updating Node {}", &node);
                                 self.router.write().await.update(node);
                             }
-                            self.process_packet(packet, addr, &find_node).await;
+                            self.process_packet(packet, addr, &find_node, &find_info_hash)
+                                .await;
                         } else {
                             warn!("Unknown packet received from {:?}", addr);
                         }
@@ -367,10 +262,16 @@ where
             }
         });
         return DhtClientController {
-            main,
-            route_maintaining,
-            find_node_sender,
-            crawler,
+            main: join_all([
+                main,
+                route_maintaining,
+                find_node_sender,
+                crawler,
+                peer_lookup_task,
+            ]),
+            info_hash_observer: ReceiverStream::new(info_hash_observer),
+            peer_lockup,
+            id: myid,
         };
     }
 
@@ -379,6 +280,7 @@ where
         packet: KRpc<'_>,
         addr: SocketAddr,
         find_node: &mpsc::Sender<SocketAddr>,
+        find_info_hash: &Sender<InfoHashObservation>,
     ) {
         match packet {
             KRpc {
@@ -387,27 +289,42 @@ where
                 ..
             } => {
                 if let Err(err) = match query {
-                    DhtQuery::AnnouncePeer { info_hash, .. } => {
-                        self.seeds.insert(info_hash.clone());
-                        info!(
-                            "Got seed hash: {} from {} ({} in total)",
-                            info_hash,
-                            addr,
-                            self.seeds.len()
-                        );
+                    DhtQuery::AnnouncePeer {
+                        info_hash,
+                        implied_port,
+                        port,
+                        ..
+                    } => {
+                        let new_info_hash = Arc::new(info_hash.clone());
+                        let observation = if implied_port.unwrap_or_default() {
+                            InfoHashObservation::WithUtpPeerAddr {
+                                info_hash: new_info_hash,
+                                utp_addr: addr.clone(),
+                            }
+                        } else {
+                            InfoHashObservation::WithPeerAddr {
+                                info_hash: new_info_hash,
+                                peer_addr: {
+                                    let mut peer_addr = addr.clone();
+                                    peer_addr.set_port(port);
+                                    peer_addr
+                                },
+                            }
+                        };
+                        let _ = find_info_hash.try_send(observation);
+                        info!("Got seed hash (AnnouncePeer): {} from {}", info_hash, addr,);
                         self.reply_ping(transaction_id, &addr).await
                     }
                     DhtQuery::FindNode { target, .. } => {
                         self.reply_find_node(transaction_id, target, &addr).await
                     }
-                    DhtQuery::GetPeers { info_hash, .. } => {
-                        self.seeds.insert(info_hash.clone());
-                        info!(
-                            "Got seed hash: {} from {} ({} in total)",
-                            info_hash,
-                            addr,
-                            self.seeds.len()
-                        );
+                    DhtQuery::GetPeers { info_hash, id } => {
+                        let observation = InfoHashObservation::WithDhtNode {
+                            info_hash: Arc::new(info_hash.clone()),
+                            node: DhtNode::new(id.clone(), addr.clone()),
+                        };
+                        let _ = find_info_hash.try_send(observation);
+                        trace!("Got seed hash (GetPeers): {} from {}", info_hash, addr);
                         self.reply_get_peers(transaction_id, info_hash, &addr).await
                     }
                     DhtQuery::Ping { .. } => self.reply_ping(transaction_id, &addr).await,
@@ -417,6 +334,7 @@ where
             }
             KRpc {
                 body: KRpcBody::Response { response },
+                transaction_id,
                 ..
             } => match response {
                 DhtResponse::FindNode { nodes, .. } => {
@@ -424,11 +342,10 @@ where
                         let _ = find_node.try_send(new_node.addr());
                     }
                 }
-                DhtResponse::GetPeers {
-                    id: _,
-                    token: _,
-                    result: _,
-                } => (),
+                DhtResponse::GetPeers { id, result, .. } => {
+                    self.handle_get_peers_response(id, addr, transaction_id, result, find_node)
+                        .await
+                }
                 _ => (),
             },
             KRpc {
@@ -438,6 +355,80 @@ where
                 warn!("Received error package <{:?}> from {}", error, addr)
             }
         };
+    }
+
+    async fn handle_get_peers_response(
+        &mut self,
+        id: &DhtNodeId,
+        addr: SocketAddr,
+        transaction_id: &[u8],
+        result: GetPeersResult<'_>,
+        find_node: &Sender<SocketAddr>,
+    ) {
+        let dht_node = match GetPeersRequestIndex::new(id, addr, transaction_id) {
+            Ok(dht_node) => dht_node,
+            _ => return,
+        };
+        let info_hash = { self.get_peers_waiters.lock().await.remove(&dht_node) };
+        if let Some(info_hash) = info_hash {
+            match result {
+                GetPeersResult::Found(peers) => {
+                    if verify_peers(&peers) {
+                        trace!(
+                            "Invalid get_peers value from {} for hash {}",
+                            addr,
+                            info_hash
+                        );
+                        return;
+                    }
+                    if let Some(task) = self.peer_lookup_tasks.lock().await.remove(&info_hash) {
+                        info!("Get peers Found {:?} from {}", peers, addr);
+                        let result = peers.into_iter().map(|p| p.addr()).collect();
+                        if task.result.send(result).is_err() {
+                            warn!("Peers for {} already found, ignore", info_hash);
+                        }
+                    }
+                }
+                GetPeersResult::NotFound(nodes) => {
+                    if let Some(task) = self.peer_lookup_tasks.lock().await.get_mut(&info_hash) {
+                        // info!("Get peers NotFound {:?} from {}", nodes, addr);
+                        let info_hash = task.info_hash.clone();
+                        let id = self.id.clone();
+                        let socket = self.udp.clone();
+                        let get_peers_waiters = self.get_peers_waiters.clone();
+                        let visited = &mut task.visited;
+                        task.cloest_nodes.extend(
+                            nodes
+                                .nodes()
+                                .unique()
+                                .filter(|node| visited.insert(node.addr()))
+                                .map(|node| DhtNode::from(node).distence_order(&info_hash)),
+                        );
+                        let cloest_nodes = pop_n(task);
+                        spawn(async move {
+                            let mut interval = interval(Duration::from_millis(10));
+                            for node in cloest_nodes {
+                                Self::send_get_peer(
+                                    &id,
+                                    &info_hash,
+                                    &socket,
+                                    node.node(),
+                                    &get_peers_waiters,
+                                )
+                                .await;
+                                interval.tick().await;
+                            }
+                        });
+                    }
+                }
+            }
+        } else if let GetPeersResult::NotFound(nodes) = result {
+            for new_node in nodes.nodes().unique() {
+                let _ = find_node.try_send(new_node.addr());
+            }
+        } else {
+            trace!("Unknown nodes response from: {:?}", addr);
+        }
     }
 
     pub async fn find_node(&mut self, target_addr: &SocketAddr) -> Result<(), std::io::Error> {
@@ -541,7 +532,7 @@ where
     }
 
     fn start_find_node_thread(
-        myid: DhtNodeId,
+        myid: Arc<DhtNodeId>,
         socket: Arc<UdpSocket>,
         mut rt: mpsc::Receiver<SocketAddr>,
     ) -> JoinHandle<()> {
@@ -549,6 +540,7 @@ where
             let mut dedup_set: HashSet<SocketAddr> = HashSet::new();
             let mut last_clean: SystemTime = SystemTime::now();
             let mut next_transaction_id: u16 = 0;
+            let mut interval = interval(Duration::from_millis(10));
             while let Some(addr) = rt.recv().await {
                 if last_clean + Duration::from_secs(5) < SystemTime::now() {
                     dedup_set.clear();
@@ -574,6 +566,69 @@ where
                     warn!("Failed to send find_node: {}", err)
                 }
                 next_transaction_id = next_transaction_id.overflowing_add(1).0;
+
+                interval.tick().await;
+            }
+        })
+    }
+
+    fn start_lookup_peer_thread(
+        myid: Arc<DhtNodeId>,
+        router: Arc<RwLock<R>>,
+        socket: Arc<UdpSocket>,
+        peer_lookup_tasks: Arc<Mutex<HashMap<InfoHash, PeerLookupTask>>>,
+        get_peers_waiters: Arc<Mutex<LruCache<GetPeersRequestIndex, InfoHash>>>,
+        mut rx: mpsc::Receiver<PeerLookupTask>,
+    ) -> JoinHandle<()> {
+        spawn(async move {
+            while let Some(mut task) = rx.recv().await {
+                info!("Start lookup peer for {}", task.info_hash);
+                let mut tasks = peer_lookup_tasks.lock().await;
+
+                let task_entry = tasks.entry(task.info_hash.as_ref().clone());
+                match task_entry {
+                    Entry::Occupied(mut previous_task) => {
+                        warn!("Duplicate task, merging cloest_nodes");
+                        previous_task
+                            .get_mut()
+                            .cloest_nodes
+                            .append(&mut task.cloest_nodes);
+                    }
+                    Entry::Vacant(vacant) => {
+                        let info_hash = task.info_hash.clone();
+                        let task = vacant.insert(task);
+                        task.cloest_nodes.extend(
+                            router
+                                .read()
+                                .await
+                                .nearests(info_hash.as_ref())
+                                .iter()
+                                .map(|node| node.distence_order(info_hash.as_ref())),
+                        );
+                        for node in &task.cloest_nodes {
+                            Self::send_get_peer(
+                                &myid,
+                                &task.info_hash,
+                                &socket,
+                                node.node(),
+                                &get_peers_waiters,
+                            )
+                            .await
+                        }
+                        let peer_lookup_tasks = peer_lookup_tasks.clone();
+                        spawn(async move {
+                            sleep(Duration::from_secs(30)).await;
+                            if peer_lookup_tasks
+                                .lock()
+                                .await
+                                .remove(info_hash.as_ref())
+                                .is_some()
+                            {
+                                warn!("{} peer lookup timeout", info_hash);
+                            }
+                        });
+                    }
+                }
             }
         })
     }
@@ -599,7 +654,7 @@ where
                         let mut route = route_lock.write().await;
                         route.clean_unheathy()
                     };
-                    info!("Found {} unheathy nodes", unheathy.len());
+                    trace!("Found {} unheathy nodes", unheathy.len());
                     for node in unheathy {
                         if let Err(err) = tx.send(node.addr.clone()).await {
                             error!(
@@ -628,27 +683,56 @@ where
             }
         })
     }
+
+    async fn send_get_peer(
+        myid: &DhtNodeId,
+        info_hash: &InfoHash,
+        socket: &UdpSocket,
+        node: &DhtNode,
+        get_peers_waiters: &Arc<Mutex<LruCache<GetPeersRequestIndex, DhtNodeId>>>,
+    ) {
+        trace!("Sending get_peer to {}", node.addr);
+        let transaction_id = rand::random::<u16>().to_be_bytes();
+        let query = KRpc {
+            transaction_id: &transaction_id,
+            body: KRpcBody::Query(DhtQuery::GetPeers {
+                id: &myid,
+                info_hash,
+            }),
+            version: None,
+        };
+        if let Err(err) = socket
+            .send_to(&krpc::to_bytes(query).unwrap(), node.addr)
+            .await
+        {
+            warn!("Failed to send get_peer: {}", err);
+            return;
+        }
+        get_peers_waiters.lock().await.insert(
+            GetPeersRequestIndex::new_with_node(node, &transaction_id).unwrap(),
+            info_hash.clone(),
+        );
+        debug!("Sended get_peer to {}", node.addr);
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::dht::DhtNodeId;
+fn verify_peers(peers: &Vec<&krpc::DhtPeerCompact>) -> bool {
+    peers.is_empty()
+        || peers.iter().any(|p| match p.addr() {
+            SocketAddr::V4(v4) => v4.ip().is_loopback() || v4.ip().is_unspecified(),
+            SocketAddr::V6(_) => true,
+        })
+}
 
-    #[test]
-    fn dhtnodeid_ord() {
-        let mut small = [0; 20];
-        small[1] = 1;
-        let mut big = [0; 20];
-        big[0] = 1;
-        assert!(DhtNodeId(small) < DhtNodeId(big))
+fn pop_n(task: &mut PeerLookupTask) -> Vec<OrderedNode> {
+    let mut result = vec![];
+    for _ in 0..8 {
+        let node = task.cloest_nodes.pop();
+        if let Some(node) = node {
+            result.push(node)
+        } else {
+            break;
+        }
     }
-
-    #[test]
-    fn dhtnodeid_write() {
-        let mut origin = DhtNodeId([0b111; 20]);
-        let mut expected = [0b111; 20];
-        expected[0] = 0b101;
-        origin.write(153, false);
-        assert_eq!(origin, DhtNodeId(expected));
-    }
+    result
 }

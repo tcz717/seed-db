@@ -2,27 +2,28 @@ use std::{
     any::Any,
     fmt::Display,
     io::{self, ErrorKind},
+    net::SocketAddr,
     sync::Arc,
-    time::Duration,
 };
 
 use bitvec::prelude::*;
 use bytes::{BufMut, Bytes, BytesMut};
+use crypto::digest::Digest;
 use futures::SinkExt;
-use log::warn;
+use log::{info, warn};
 use serde::{
     de::{Error, Unexpected, Visitor},
     ser::SerializeMap,
     Deserialize, Serialize,
 };
-use tokio::{spawn, sync::Mutex};
+use tokio::sync::Mutex;
 
-use super::{
-    ExtensionPlugin, ExtensionPluginName, PeerConnectionState, PeerSink,
-    LT_EXTENSION_MSG_ID,
-};
+use crate::dht::{DhtNodeId, InfoHash};
+
+use super::{ExtensionPlugin, ExtensionPluginName, PeerConnection, LT_EXTENSION_MSG_ID};
 
 const KB: u64 = 1024;
+const PIECE_SIZE: usize = 16 * KB as usize;
 
 #[derive(Debug)]
 pub enum MetadataMessage {
@@ -131,76 +132,83 @@ struct MetadataDownloadProgress {
 }
 
 impl MetadataDownloadProgress {
-    fn new(pieces: usize) -> Self {
+    fn new(size: usize) -> Self {
         Self {
-            metadata: vec![0; pieces].into_boxed_slice(),
-            pieces: bitvec![0;pieces],
+            metadata: vec![0; size].into_boxed_slice(),
+            pieces: bitvec![0; (size - 1) / PIECE_SIZE + 1],
         }
     }
 }
-#[derive(Debug)]
-pub struct MetadataDownload {
-    progress: Arc<Mutex<MetadataDownloadProgress>>,
-    sink: Arc<Mutex<PeerSink>>,
-    remote_ext_id: u8,
+
+pub async fn request_metadata_from_peer(
+    addr: &SocketAddr,
+    info_hash: &InfoHash,
+    local_id: &DhtNodeId,
+) -> Result<Box<[u8]>, std::io::Error> {
+    let mut connection = PeerConnection::connect(&addr, &info_hash, &local_id).await?;
+
+    connection.extension_handshake().await?;
+
+    request_all_metadata(&mut connection).await
 }
 
-impl MetadataDownload {
-    pub async fn run(self) -> Result<Option<Box<[u8]>>, std::io::Error> {
-        spawn(async move {
-            while let Some((next_piece, _)) = self
-                .progress
-                .lock()
-                .await
-                .pieces
-                .iter()
-                .by_val()
-                .enumerate()
-                .find(|(_, p)| *p)
-            {
-                let request = MetadataMessage::Request { piece: next_piece };
-                let mut buf = BytesMut::new();
+pub async fn request_all_metadata(
+    connection: &mut PeerConnection,
+) -> Result<Box<[u8]>, std::io::Error> {
+    let remote_ext_id = connection
+        .state
+        .get_remote_ext_id(<MetadataExtension as ExtensionPluginName>::msg_name())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, MetadataError::NoPlugin))?;
+    let local_ext_id = connection
+        .state
+        .get_local_ext_id(<MetadataExtension as ExtensionPluginName>::msg_name())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, MetadataError::NoPlugin))?;
+    let progress = connection
+        .state
+        .get_extension::<MetadataExtension>()
+        .and_then(|ext| ext.progress.as_ref())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, MetadataError::MissingSize))?
+        .clone();
+    while let Some(next_piece) = {
+        let progress = progress.lock().await;
+        progress
+            .pieces
+            .iter()
+            .by_val()
+            .enumerate()
+            .find(|(_, p)| !*p)
+            .map(|p| p.0)
+    } {
+        let request = MetadataMessage::Request { piece: next_piece };
+        let mut buf = BytesMut::new();
 
-                buf.put_u8(LT_EXTENSION_MSG_ID);
-                buf.put_u8(self.remote_ext_id);
-                buf.put(request.to_bytes().unwrap().as_slice());
-                self.sink.lock().await.send(buf.freeze()).await?;
+        buf.put_u8(LT_EXTENSION_MSG_ID);
+        buf.put_u8(remote_ext_id);
+        buf.put(request.to_bytes().unwrap().as_slice());
+        connection.stream.send(buf.freeze()).await?;
 
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            Ok::<Option<Box<[u8]>>, io::Error>(None)
-        })
-        .await
-        .unwrap()
+        while !progress.lock().await.pieces[next_piece] {
+            connection.expect_extended_msg(local_ext_id).await?;
+        }
     }
+
+    let progress = progress.lock_owned().await;
+    let mut hasher = crypto::sha1::Sha1::new();
+    hasher.input(&progress.metadata);
+    let mut hash = [0u8; 20];
+    hasher.result(&mut hash);
+    if &hash != connection.info_hash.as_ref().as_ref() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            MetadataError::HashNotMatch,
+        ));
+    }
+    Ok::<Box<[u8]>, io::Error>(progress.metadata.clone())
 }
 
 #[derive(Debug, Default)]
 pub struct MetadataExtension {
     progress: Option<Arc<Mutex<MetadataDownloadProgress>>>,
-    sink: Option<Arc<Mutex<PeerSink>>>,
-}
-
-impl MetadataExtension {
-    pub fn request_all_metadata(
-        &self,
-        state: &PeerConnectionState,
-    ) -> Result<MetadataDownload, MetadataError> {
-        let sink = self.sink.as_ref().ok_or(MetadataError::NotInit)?.clone();
-        let progress = self
-            .progress
-            .as_ref()
-            .ok_or(MetadataError::MissingSize)?
-            .clone();
-        let remote_ext_id = state
-            .get_remote_ext_id(self.msg_name())
-            .ok_or(MetadataError::NotInit)?;
-        Ok(MetadataDownload {
-            progress,
-            sink,
-            remote_ext_id,
-        })
-    }
 }
 
 #[derive(Debug)]
@@ -211,6 +219,8 @@ pub enum MetadataError {
     DeserializeFailed,
     InvalidDataSize,
     NotInit,
+    NoPlugin,
+    HashNotMatch,
 }
 
 impl std::error::Error for MetadataError {}
@@ -231,7 +241,6 @@ impl ExtensionPluginName for MetadataExtension {
 impl ExtensionPlugin for MetadataExtension {
     async fn process(&mut self, data: &mut Bytes) -> Result<Option<Bytes>, std::io::Error> {
         if let Some(msg) = MetadataMessage::from_bytes(data) {
-            println!("{:#?}", msg);
             match msg {
                 MetadataMessage::Request { .. } => {
                     let reply = MetadataMessage::Reject.to_bytes();
@@ -247,8 +256,9 @@ impl ExtensionPlugin for MetadataExtension {
                 MetadataMessage::Data { piece, total_size } => {
                     if let Some(ref mut metadata) = self.progress {
                         let mut progress = metadata.lock().await;
-                        let start = piece * (16 * KB as usize);
-                        let end = start + total_size;
+                        let start = piece * PIECE_SIZE;
+                        let end = total_size.min(start + PIECE_SIZE);
+                        let piece_size = end - start;
 
                         if end > progress.metadata.len() {
                             return Err(io::Error::new(
@@ -257,9 +267,11 @@ impl ExtensionPlugin for MetadataExtension {
                             ));
                         }
 
-                        let data = data.split_off(data.len() - total_size);
+                        let data = data.split_off(data.len() - piece_size);
                         progress.metadata[start..end].copy_from_slice(&data);
-                        *progress.pieces.get_mut(piece).unwrap() = false;
+                        *progress.pieces.get_mut(piece).unwrap() = true;
+
+                        info!("Piece {} ({}..{}) downloaded", piece, start, end);
 
                         Ok(None)
                     } else {
@@ -284,7 +296,7 @@ impl ExtensionPlugin for MetadataExtension {
     }
 
     fn handshake(&mut self, handshake: &super::ExtensionHandshake) -> Result<(), io::Error> {
-        if let Some(size) = handshake.matadata_size {
+        if let Some(size) = handshake.metadata_size {
             if size > 512 * KB {
                 warn!("Metadata size {} too large", size);
                 return Err(io::Error::new(
@@ -293,10 +305,13 @@ impl ExtensionPlugin for MetadataExtension {
                 ));
             }
             if self.progress.is_none() {
+                info!("Metadata size: {}", size);
                 self.progress = Some(Arc::new(Mutex::new(MetadataDownloadProgress::new(
                     size as usize,
                 ))));
             }
+        } else {
+            warn!("Metadata size not specified in handshake")
         }
         Ok(())
     }

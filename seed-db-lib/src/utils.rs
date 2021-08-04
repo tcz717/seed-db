@@ -16,7 +16,7 @@ impl<'de, const N: usize> Visitor<'de> for BytesVisitor<N> {
             .map_err(|_| serde::de::Error::invalid_length(v.len(), &self))?)
     }
 }
-struct BorrowedBytesVisitor<const N: usize>;
+pub(crate) struct BorrowedBytesVisitor<const N: usize>;
 impl<'de, const N: usize> Visitor<'de> for BorrowedBytesVisitor<N> {
     type Value = &'de [u8; N];
 
@@ -44,5 +44,28 @@ impl<'de> Visitor<'de> for BytesSliceVisitor {
         E: serde::de::Error,
     {
         Ok(v)
+    }
+}
+
+pub(crate) mod skip_none {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(crate) fn serialize<T, S>(this: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Serialize,
+    {
+        match this {
+            Some(val) => val.serialize(serializer),
+            None => unimplemented!(),
+        }
+    }
+
+    pub(crate) fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        Ok(Some(T::deserialize(deserializer)?))
     }
 }
