@@ -72,8 +72,8 @@ pub enum DhtQuery<'a> {
         id: &'a DhtNodeId,
         #[serde(default)]
         #[serde(skip_serializing_if = "Option::is_none")]
-        #[serde(serialize_with = "DhtQuery::serialize_implied_port")]
-        implied_port: Option<bool>,
+        #[serde(with = "crate::utils::skip_none")]
+        implied_port: Option<u32>,
         info_hash: &'a InfoHash,
         port: u16,
         #[serde(with = "serde_bytes")]
@@ -116,18 +116,6 @@ pub enum GetPeersResult<'a> {
     #[serde(rename = "nodes")]
     #[serde(borrow)]
     NotFound(DhtNodeCompactList<'a>),
-}
-
-impl<'a> DhtQuery<'a> {
-    fn serialize_implied_port<S>(val: &Option<bool>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match val {
-            Some(b) => serializer.serialize_bool(*b),
-            None => unimplemented!(),
-        }
-    }
 }
 
 #[derive(PartialEq, Clone)]
@@ -400,7 +388,7 @@ mod tests {
             transaction_id: b"aa",
             body: KRpcBody::Query(DhtQuery::AnnouncePeer {
                 id: &id,
-                implied_port: Some(true),
+                implied_port: Some(1),
                 info_hash: &info_hash,
                 port: 6881,
                 token: b"aoeusnth",
@@ -583,6 +571,22 @@ mod tests {
     #[test]
     fn deserialize_announce_peer_query_1() {
         let hex=b"64313a6164323a696432303a832ab4a7493e16d272f9b40c3879d39784047db0393a696e666f5f6861736832303a4307ad94c16ff225cb8ce1a7bfa91e6b6d2f81b1343a706f7274693130373365353a746f6b656e353a406e8ae53d65313a7131333a616e6e6f756e63655f70656572313a74313a0d313a79313a7165";
+
+        let bytes: Vec<_> = from_hex(hex);
+
+        let packet = super::from_bytes(&bytes);
+        assert!(matches!(
+            packet.unwrap(),
+            super::KRpc {
+                body: KRpcBody::Query(super::DhtQuery::AnnouncePeer { .. }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn deserialize_announce_peer_query_2() {
+        let hex=b"64313a6164323a696432303a1ffb4da10d3087dee4239dd2daae8457a6cff4c731323a696d706c6965645f706f7274693065393a696e666f5f6861736832303a460c60b879c54d3032d8aef6f426a015c5d5adc3343a706f727469353331323165353a746f6b656e353a06fc54805c65313a7131333a616e6e6f756e63655f70656572313a74323a0a68313a79313a7165";
 
         let bytes: Vec<_> = from_hex(hex);
 

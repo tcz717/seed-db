@@ -210,7 +210,9 @@ pub mod kademila {
 
         fn clean_unheathy(&mut self) -> Vec<SharedDhtNode> {
             let old_nodes = self.unheathy.drain().collect::<Vec<_>>();
-            info!("Cleaned {} nodes", old_nodes.len());
+            if old_nodes.len() > 0 {
+                info!("Cleaned {} nodes", old_nodes.len());
+            }
             for node in old_nodes {
                 self.drop_node(&node);
             }
